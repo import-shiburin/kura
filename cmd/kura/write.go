@@ -21,7 +21,7 @@ func runWrite(argv []string) {
 	var (
 		planPath    = fs.String("plan", "plan.json", "plan to execute")
 		catalogPath = fs.String("catalog", "", "catalog to read and update (required)")
-		drive       = fs.String("drive", "", "directory standing in for the loaded volume (required)")
+		mount       = fs.String("mount", "", "where the loaded volume is mounted (required)")
 		volumeID    = fs.String("volume", "", "which volume of the plan to write; default is the first one not yet written")
 		copies      = fs.Int("catalog-copies", archive.DefaultCatalogCopies, "how many times to write the catalog onto the volume")
 		dryRun      = fs.Bool("dry-run", false, "read and digest everything, write nothing")
@@ -34,11 +34,13 @@ Writes exactly one volume and exits. Run it again, with the next cartridge
 loaded, for the next one: state lives in the catalog, so the drive can be
 powered off for weeks in between.
 
-  kura write -plan plan.json -catalog catalog.jsonl.gz -drive /mnt/lto/LTO001
+  kura write -plan plan.json -catalog catalog.jsonl.gz -mount /mnt/lto
 
-The directory named by -drive stands in for the loaded medium, and its base name
-is the volume's identity — writing to a volume the plan does not expect is
-refused rather than guessed at.
+-mount is where the medium is mounted, and nothing more: a drive is one fixed
+path and the cartridge in it is whichever one you pushed in. Which volume that
+is comes from the medium's own kura.volume.json, so loading the wrong cartridge
+is refused rather than guessed at. A blank cartridge has no identity yet and
+becomes the volume the plan asked for.
 
 What goes in which container was settled by kura plan and is recorded in the
 plan file, so a write that is interrupted and re-run places exactly the same
@@ -50,8 +52,8 @@ Flags:
 	}
 	fs.Parse(argv)
 
-	if *catalogPath == "" || *drive == "" {
-		fmt.Fprintln(os.Stderr, "error: -catalog and -drive are both required")
+	if *catalogPath == "" || *mount == "" {
+		fmt.Fprintln(os.Stderr, "error: -catalog and -mount are both required")
 		fs.Usage()
 		os.Exit(2)
 	}
@@ -84,7 +86,7 @@ Flags:
 	// Declaring the plan's capacity to the backend is what makes "the volume
 	// filled up" reachable instead of silently spilling onto the host's disk.
 	backend := filevol.New(pv.Capacity + pv.Reserved)
-	if err := backend.Load(*drive); err != nil {
+	if err := backend.Load(*mount); err != nil {
 		fatal(err)
 	}
 	ctx := context.Background()
@@ -94,10 +96,11 @@ Flags:
 	}
 	defer backend.Release(ctx)
 
-	if vol.ID() != pv.ID {
-		fatal(fmt.Errorf("the loaded volume is %s but the plan expects %s; load the right cartridge or pass -volume %s",
-			vol.ID(), pv.ID, vol.ID()))
-	}
+	// The cartridge check belongs to archive.Write, which compares what the
+	// medium says it is against the volume the plan asked for. It cannot happen
+	// here: opening the drive says nothing about which cartridge is in it, and
+	// the check that used to sit at this point compared the plan against the
+	// mount point's name, so it only ever agreed with itself.
 
 	if err := ensureArchiveID(ctx, cat, vol, *catalogPath, *dryRun); err != nil {
 		fatal(err)
@@ -188,7 +191,7 @@ func ensureArchiveID(ctx context.Context, cat *catalog.Catalog, vol volume.Volum
 	switch {
 	case onMedium != "":
 		cat.Header.Archive = onMedium
-		fmt.Fprintf(os.Stderr, "adopting archive %s from %s; the catalog did not name one\n", onMedium, vol.ID())
+		fmt.Fprintf(os.Stderr, "adopting archive %s from the loaded volume; the catalog did not name one\n", onMedium)
 	default:
 		id, err := archive.NewArchiveID()
 		if err != nil {

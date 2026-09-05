@@ -33,14 +33,14 @@
             "-capacity", "64MB", "-max-group", "16MB",
         )
         volumes = plan_volumes(machine)
-        for slot, vid in enumerate(volumes, start=1):
+        for slot in range(1, len(volumes) + 1):
             blank(machine, slot)
-            write_volume(machine, slot, vid)
+            write_volume(machine, slot)
         for slot, vid in enumerate(volumes, start=1):
-            assert_contains(verify_volume(machine, slot, vid), "Clean.", f"first verify of {vid}")
+            assert_contains(verify_volume(machine, slot), "Clean.", f"first verify of {vid}")
 
     with subtest("one byte inside one container member is flipped"):
-        mount = load(machine, 1, volumes[0])
+        mount = load(machine, 1)
         container = machine.succeed(
             f"find {mount}/containers -name '*.tar' -printf '%s %p\\n' | sort -rn | head -1 | cut -d' ' -f2-"
         ).strip()
@@ -54,8 +54,8 @@
         unload(machine)
 
     with subtest("verify catches it and names the one file it cost"):
-        mount = load(machine, 1, volumes[0])
-        status, out = kura_status(machine, "verify", "-catalog", CATALOG, "-drive", mount)
+        mount = load(machine, 1)
+        status, out = kura_status(machine, "verify", "-catalog", CATALOG, "-mount", mount)
         unload(machine)
 
         assert status != 0, f"verify passed over a corrupted container:\n{out}"
@@ -78,7 +78,7 @@
     with subtest("a restore of the damaged volume refuses to look complete"):
         status, out = kura_status(
             machine, "restore", "-catalog", CATALOG,
-            "-drive", load(machine, 1, volumes[0]), "-into", "/tmp/partial",
+            "-mount", load(machine, 1), "-into", "/tmp/partial",
         )
         unload(machine)
         assert status != 0, "a restore missing a lost file reported success"
@@ -103,8 +103,8 @@
         slot = len(volumes) + 1
         for vid in gen2:
             blank(machine, slot)
-            write_volume(machine, slot, vid)
-            assert_contains(verify_volume(machine, slot, vid), "Clean.", f"verify of {vid}")
+            write_volume(machine, slot)
+            assert_contains(verify_volume(machine, slot), "Clean.", f"verify of {vid}")
             slot += 1
   '';
 }

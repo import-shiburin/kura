@@ -57,13 +57,17 @@ func (r *VerifyResult) Failed() bool { return len(r.Findings) > 0 }
 // Records whose objects cannot be produced are marked lost, which is what makes
 // the next cycle re-source them from the live tree without any extra machinery.
 func Verify(ctx context.Context, vol volume.Volume, cat *catalog.Catalog, mark bool) (*VerifyResult, error) {
-	if _, err := ReadHeader(ctx, vol); err != nil {
+	// Which volume this is comes off the medium. There is no plan here to say
+	// what was expected — a scrub checks whatever is in the drive — so the
+	// header is both the identity and the only thing to check it against.
+	h, err := ReadHeader(ctx, vol)
+	if err != nil {
 		return nil, err
 	}
 	started := time.Now()
-	res := &VerifyResult{Volume: vol.ID()}
+	res := &VerifyResult{Volume: h.Volume}
 
-	records := cat.OnVolume(vol.ID())
+	records := cat.OnVolume(h.Volume)
 	// Both plaintext metadata objects are accounted for by existing rather than
 	// by a catalog record; an unclaimed report on them would be noise on every
 	// single verify.
@@ -100,7 +104,7 @@ func Verify(ctx context.Context, vol volume.Volume, cat *catalog.Catalog, mark b
 	res.Elapsed = time.Since(started)
 	if mark {
 		res.markLost(cat)
-		info := cat.Header.Volume(vol.ID())
+		info := cat.Header.Volume(res.Volume)
 		// Only a clean pass updates the timestamp. A volume with findings has
 		// not been verified; it has been found wanting, and it should still
 		// come up as overdue until it reads clean or is migrated.
@@ -131,7 +135,7 @@ func (r *VerifyResult) checkObject(ctx context.Context, vol volume.Volume, rec *
 
 func (r *VerifyResult) checkParts(ctx context.Context, vol volume.Volume, rec *catalog.Record, claimed map[string]bool) {
 	for _, p := range rec.Parts {
-		if p.Volume != vol.ID() {
+		if p.Volume != r.Volume {
 			continue // another cartridge's problem, checked when it is mounted
 		}
 		claimed[p.Object] = true

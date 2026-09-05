@@ -113,7 +113,7 @@ func readJSON(ctx context.Context, vol volume.Volume, name string, v any) error 
 		return err
 	}
 	if err := json.Unmarshal(b, v); err != nil {
-		return fmt.Errorf("%s on %s: %w", name, vol.ID(), err)
+		return fmt.Errorf("%s on the loaded volume: %w", name, err)
 	}
 	return nil
 }
@@ -126,32 +126,60 @@ func ReadArchiveHeader(ctx context.Context, vol volume.Volume) (*ArchiveHeader, 
 		return nil, err
 	}
 	if h.Magic != ArchiveMagic {
-		return nil, fmt.Errorf("%s on %s: not a kura archive (magic %q)", ArchiveObject, vol.ID(), h.Magic)
+		return nil, fmt.Errorf("%s on the loaded volume: not a kura archive (magic %q)", ArchiveObject, h.Magic)
 	}
 	if h.Format > HeaderFormat {
-		return nil, fmt.Errorf("volume %s was written by a newer kura (archive format %d, this build understands %d)",
-			vol.ID(), h.Format, HeaderFormat)
+		return nil, fmt.Errorf("the loaded volume was written by a newer kura (archive format %d, this build understands %d)",
+			h.Format, HeaderFormat)
 	}
 	if h.Archive == "" {
-		return nil, fmt.Errorf("%s on %s names no archive", ArchiveObject, vol.ID())
+		return nil, fmt.Errorf("%s on the loaded volume names no archive", ArchiveObject)
 	}
 	return h, nil
 }
 
 // ReadHeader returns the volume's own header, or ErrBlank when it has none.
+//
+// Errors here name "the loaded volume" rather than a volume ID, because this is
+// the call that establishes what the ID is. Anything further up that has a
+// header in hand should report h.Volume instead.
 func ReadHeader(ctx context.Context, vol volume.Volume) (*VolumeHeader, error) {
 	h := new(VolumeHeader)
 	if err := readJSON(ctx, vol, HeaderObject, h); err != nil {
 		return nil, err
 	}
 	if h.Magic != HeaderMagic {
-		return nil, fmt.Errorf("%s on %s: not a kura volume (magic %q)", HeaderObject, vol.ID(), h.Magic)
+		return nil, fmt.Errorf("%s on the loaded volume: not a kura volume (magic %q)", HeaderObject, h.Magic)
 	}
 	if h.Format > HeaderFormat {
-		return nil, fmt.Errorf("volume %s was written by a newer kura (header format %d, this build understands %d)",
-			vol.ID(), h.Format, HeaderFormat)
+		return nil, fmt.Errorf("the loaded volume was written by a newer kura (header format %d, this build understands %d)",
+			h.Format, HeaderFormat)
+	}
+	// A header that names no volume cannot identify the cartridge it is on, and
+	// nothing downstream has a second source to fall back to now that the mount
+	// point is not one. Refuse it here rather than let "" propagate into catalog
+	// records as a volume ID.
+	if h.Volume == "" {
+		return nil, fmt.Errorf("%s on the loaded volume names no volume", HeaderObject)
 	}
 	return h, nil
+}
+
+// VolumeIDOn reports which cartridge is loaded, according to the medium itself,
+// or "" when the volume is blank.
+//
+// This is the only answer to "what is in the drive". The medium is the
+// authority (DESIGN §11) and here it is also the sole witness: the drive is a
+// fixed mount point, so nothing outside the volume knows which one it holds.
+func VolumeIDOn(ctx context.Context, vol volume.Volume) (string, error) {
+	h, err := ReadHeader(ctx, vol)
+	if errors.Is(err, ErrBlank) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return h.Volume, nil
 }
 
 // ArchiveIDOn reports the archive a loaded volume belongs to, or "" when the
@@ -188,9 +216,26 @@ var ErrForeign = errors.New("volume belongs to another archive")
 // a volume that is ahead, and merging a divergent one, need the volume's own
 // catalog compared against the local one and are not built yet — both stop
 // here rather than guessing, which is the point of the table.
-func Reconcile(ctx context.Context, vol volume.Volume, archiveID string, gen int, dryRun bool) (*VolumeHeader, error) {
+//
+// want is the volume the caller means to write, which comes from the plan. It
+// has two jobs, and they are the two halves of the identity problem:
+//
+//   - On a written cartridge it is the check. The medium says which volume it
+//     is; disagreeing with the plan means the operator loaded the wrong one,
+//     and that is refused rather than guessed at.
+//   - On a blank cartridge it is the answer. A fresh volume carries no
+//     identity, and nothing else can supply one — the drive is a fixed mount
+//     point — so the plan names it and this stamps it.
+//
+// Being both is why it cannot be omitted. A blank volume with no want has no
+// way to become anything, and a written one with no want would be accepted
+// whatever it turned out to hold.
+func Reconcile(ctx context.Context, vol volume.Volume, archiveID, want string, gen int, dryRun bool) (*VolumeHeader, error) {
 	if archiveID == "" {
 		return nil, errors.New("archive: cannot reconcile without an archive ID")
+	}
+	if want == "" {
+		return nil, errors.New("archive: cannot reconcile without the volume the plan expects")
 	}
 
 	// The archive header first, because it is the one that decides whether this
@@ -202,16 +247,16 @@ func Reconcile(ctx context.Context, vol volume.Volume, archiveID string, gen int
 		ah = &ArchiveHeader{Magic: ArchiveMagic, Format: HeaderFormat, Archive: archiveID}
 		if !dryRun {
 			if err := putJSON(ctx, vol, ArchiveObject, ah); err != nil {
-				return nil, fmt.Errorf("stamping the archive header on %s: %w", vol.ID(), err)
+				return nil, fmt.Errorf("stamping the archive header on the loaded volume: %w", err)
 			}
 		}
 	case err != nil:
 		return nil, err
 	case ah.Archive != archiveID:
-		return nil, fmt.Errorf("%w: %s belongs to archive %s, this one is %s",
-			ErrForeign, vol.ID(), ah.Archive, archiveID)
+		return nil, fmt.Errorf("%w: the loaded volume belongs to archive %s, this one is %s",
+			ErrForeign, ah.Archive, archiveID)
 	case ah.Encrypted:
-		return nil, fmt.Errorf("volume %s is encrypted and encryption is not implemented yet", vol.ID())
+		return nil, errors.New("the loaded volume is encrypted and encryption is not implemented yet")
 	}
 
 	h, err := ReadHeader(ctx, vol)
@@ -225,13 +270,13 @@ func Reconcile(ctx context.Context, vol volume.Volume, archiveID string, gen int
 			Magic:   HeaderMagic,
 			Format:  HeaderFormat,
 			Archive: archiveID,
-			Volume:  vol.ID(),
+			Volume:  want,
 		}
 		if dryRun {
 			return h, nil
 		}
 		if err := putJSON(ctx, vol, HeaderObject, h); err != nil {
-			return nil, fmt.Errorf("stamping %s: %w", vol.ID(), err)
+			return nil, fmt.Errorf("stamping the loaded volume as %s: %w", want, err)
 		}
 		return h, nil
 
@@ -244,13 +289,16 @@ func Reconcile(ctx context.Context, vol volume.Volume, archiveID string, gen int
 		// above cannot catch on its own. A cartridge assembled from pieces of
 		// two archives is a corrupt volume, not a foreign one.
 		return nil, fmt.Errorf("volume %s: %s names archive %s but %s names %s; the volume's own metadata disagrees",
-			vol.ID(), HeaderObject, h.Archive, ArchiveObject, archiveID)
+			h.Volume, HeaderObject, h.Archive, ArchiveObject, archiveID)
 	}
-	if h.Volume != vol.ID() {
-		// The medium says it is a different cartridge from the one the drive
-		// reports. Never guess which is right.
-		return nil, fmt.Errorf("volume %s carries a header for %s; refusing to write to a volume that cannot identify itself",
-			vol.ID(), h.Volume)
+	if h.Volume != want {
+		// The operator loaded the wrong cartridge. This is the check that used
+		// to compare the header against the mount point's name, which only ever
+		// restated where the volume had been mounted; comparing it against the
+		// plan is what actually catches a wrong cartridge, and it catches it on
+		// a drive mounted at one fixed path, which is how a real one works.
+		return nil, fmt.Errorf("the drive holds volume %s but the plan expects %s; load %s, or pass -volume %s to write the volume that is in",
+			h.Volume, want, want, h.Volume)
 	}
 
 	// The "volume ahead" row of DESIGN §11, answered from what the cartridge
@@ -265,7 +313,7 @@ func Reconcile(ctx context.Context, vol volume.Volume, archiveID string, gen int
 	}
 	if newest > gen {
 		return nil, fmt.Errorf("volume %s holds generation %d but this run is generation %d: the volume is ahead of the catalog, which needs an explicit adopt rather than a write",
-			vol.ID(), newest, gen)
+			h.Volume, newest, gen)
 	}
 	return h, nil
 }

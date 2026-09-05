@@ -95,11 +95,16 @@ func (f *fixture) plan(opts ...func(*plan.PackOptions)) *plan.Plan {
 	return p
 }
 
-// mount opens one volume off the shelf, creating it if this is its first use.
-func (f *fixture) mount(id string) (volume.Volume, func()) {
+// mount loads the cartridge kept in one slot of the shelf, creating it if this
+// is its first use.
+//
+// The slot name is a storage location and nothing else — a volume's identity
+// lives in the header it carries, never in where it was mounted. Tests that
+// care about the difference pass a slot that is not the volume ID.
+func (f *fixture) mount(slot string) (volume.Volume, func()) {
 	f.t.Helper()
 	b := filevol.New(f.cap)
-	if err := b.Load(filepath.Join(f.shelf, id)); err != nil {
+	if err := b.Load(filepath.Join(f.shelf, slot)); err != nil {
 		f.t.Fatal(err)
 	}
 	vol, err := b.Open(context.Background())
@@ -523,7 +528,7 @@ func TestForeignVolumeIsRefused(t *testing.T) {
 	p := f.plan()
 
 	vol, done := f.mount(p.Volumes[0].ID)
-	if _, err := Reconcile(context.Background(), vol, "somebody-elses-archive", 1, false); err != nil {
+	if _, err := Reconcile(context.Background(), vol, "somebody-elses-archive", p.Volumes[0].ID, 1, false); err != nil {
 		t.Fatal(err)
 	}
 	done()
@@ -832,7 +837,7 @@ func TestReconcileFinishesAnInterruptedStamp(t *testing.T) {
 
 	vol, done = f.mount("LTO001")
 	defer done()
-	h, err := Reconcile(ctx, vol, "test-archive", 1, false)
+	h, err := Reconcile(ctx, vol, "test-archive", "LTO001", 1, false)
 	if err != nil {
 		t.Fatalf("a half-stamped volume of our own archive was refused: %v", err)
 	}
@@ -899,7 +904,7 @@ func TestHeadersThatDisagreeAreRefused(t *testing.T) {
 
 	vol, done = f.mount("LTO001")
 	defer done()
-	_, err := Reconcile(ctx, vol, "test-archive", 1, false)
+	_, err := Reconcile(ctx, vol, "test-archive", "LTO001", 1, false)
 	if err == nil {
 		t.Fatal("a volume whose two headers name different archives was accepted")
 	}
@@ -918,8 +923,341 @@ func TestReconcileRefusesAnEmptyArchiveID(t *testing.T) {
 	vol, done := f.mount("LTO001")
 	defer done()
 
-	if _, err := Reconcile(context.Background(), vol, "", 1, false); err == nil {
+	if _, err := Reconcile(context.Background(), vol, "", "LTO001", 1, false); err == nil {
 		t.Fatal("Reconcile accepted an empty archive ID")
+	}
+}
+
+// A volume is identified by the header it carries, never by where it is
+// mounted. This is the bug the whole identity path was rebuilt around: the file
+// backend used to return its directory's base name as the volume ID, so a
+// cartridge only kept its identity while it was mounted at a path named after
+// it. A real drive is one fixed mount point, which made that arrangement
+// unusable the moment it met actual hardware.
+//
+// Moving the cartridge between mount points is the whole test: nothing about
+// the medium changes, only where it appears.
+func TestVolumeIdentityFollowsTheMediumNotTheMountPoint(t *testing.T) {
+	f := newFixture(t, 4<<20, plan.Layout{})
+	f.write(map[string]int{"a.bin": 4096})
+	p := f.plan()
+	ctx := context.Background()
+
+	vol, done := f.mount("drive")
+	res, err := Write(ctx, vol, p.Volumes[0], f.cat, Options{
+		Archive: f.cat.Header.Archive, Generation: p.Generation,
+	})
+	done()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Volume != p.Volumes[0].ID {
+		t.Fatalf("the write recorded volume %q, want %q; identity came from the mount point",
+			res.Volume, p.Volumes[0].ID)
+	}
+	for _, rec := range res.Records {
+		if rec.Volume != p.Volumes[0].ID {
+			t.Fatalf("%s was recorded on volume %q, want %q", rec.Path, rec.Volume, p.Volumes[0].ID)
+		}
+	}
+
+	// The same cartridge, carried to a differently named drive.
+	if err := os.Rename(filepath.Join(f.shelf, "drive"), filepath.Join(f.shelf, "some-other-drive")); err != nil {
+		t.Fatal(err)
+	}
+
+	vol, done = f.mount("some-other-drive")
+	defer done()
+	got, err := VolumeIDOn(ctx, vol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != p.Volumes[0].ID {
+		t.Errorf("after remounting elsewhere the volume identified as %q, want %q", got, p.Volumes[0].ID)
+	}
+
+	// And it still verifies, which is what would break in practice: records
+	// found by volume ID would match nothing at all.
+	vres, err := Verify(ctx, vol, f.cat, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vres.Failed() || vres.Checked == 0 {
+		t.Errorf("verify after remounting checked %d objects, findings %v", vres.Checked, vres.Findings)
+	}
+}
+
+// The wrong cartridge in the drive is refused, at one fixed mount point.
+//
+// The old check compared the medium's header against the mount point's base
+// name, so it could only ever agree with itself: both sides came from the same
+// string. Comparing against the volume the plan asked for is what makes it a
+// real check, and this is the arrangement it has to hold under — the operator
+// pushes a different cartridge into the same drive.
+func TestTheWrongCartridgeInTheDriveIsRefused(t *testing.T) {
+	f := newFixture(t, 4<<20, plan.Layout{})
+	ctx := context.Background()
+
+	vol, done := f.mount("drive")
+	if _, err := Reconcile(ctx, vol, "test-archive", "LTO001", 1, false); err != nil {
+		t.Fatal(err)
+	}
+	done()
+
+	vol, done = f.mount("drive")
+	defer done()
+	_, err := Reconcile(ctx, vol, "test-archive", "LTO002", 1, false)
+	if err == nil {
+		t.Fatal("writing LTO002 onto the cartridge holding LTO001 was accepted")
+	}
+	// Both IDs, because "wrong cartridge" is useless without saying which one
+	// is in and which one is wanted.
+	for _, want := range []string{"LTO001", "LTO002"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not name %s: %v", want, err)
+		}
+	}
+	if errors.Is(err, ErrForeign) {
+		t.Error("the right archive's wrong cartridge is not a foreign volume")
+	}
+}
+
+// VolumeIDOn is the only way to ask what is in the drive, so both of its
+// answers have to be trustworthy: the ID for a written cartridge, and an empty
+// string — not an error — for a blank one, which is what tells the caller the
+// drive holds something new rather than something broken.
+func TestVolumeIDOnReportsWhatTheMediumSays(t *testing.T) {
+	f := newFixture(t, 4<<20, plan.Layout{})
+	ctx := context.Background()
+
+	vol, done := f.mount("drive")
+	got, err := VolumeIDOn(ctx, vol)
+	if err != nil {
+		t.Fatalf("a blank volume should not be an error: %v", err)
+	}
+	if got != "" {
+		t.Errorf("VolumeIDOn = %q on a blank volume, want empty", got)
+	}
+
+	if _, err := Reconcile(ctx, vol, "test-archive", "LTO007", 1, false); err != nil {
+		t.Fatal(err)
+	}
+	done()
+
+	vol, done = f.mount("drive")
+	defer done()
+	got, err = VolumeIDOn(ctx, vol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "LTO007" {
+		t.Errorf("VolumeIDOn = %q after stamping, want LTO007", got)
+	}
+}
+
+// Every way the two plaintext objects can be malformed is a refusal.
+//
+// These matter more than they look. Identity now rests entirely on these two
+// objects — there is no mount point to fall back on and no barcode to compare
+// against — so a header this tool cannot fully understand is a cartridge it
+// cannot safely write to, and each case has to say which of the two objects is
+// at fault and why.
+func TestMalformedHeadersAreRefused(t *testing.T) {
+	ctx := context.Background()
+	future := HeaderFormat + 1
+
+	cases := []struct {
+		name   string
+		object string
+		header any
+		want   string
+	}{
+		{"an archive header with the wrong magic", ArchiveObject,
+			&ArchiveHeader{Magic: "something-else", Format: HeaderFormat, Archive: "test-archive"},
+			"not a kura archive"},
+		{"an archive header from a newer kura", ArchiveObject,
+			&ArchiveHeader{Magic: ArchiveMagic, Format: future, Archive: "test-archive"},
+			"newer kura"},
+		{"an archive header naming no archive", ArchiveObject,
+			&ArchiveHeader{Magic: ArchiveMagic, Format: HeaderFormat},
+			"names no archive"},
+		{"a volume header with the wrong magic", HeaderObject,
+			&VolumeHeader{Magic: "something-else", Format: HeaderFormat, Archive: "test-archive", Volume: "LTO001"},
+			"not a kura volume"},
+		{"a volume header from a newer kura", HeaderObject,
+			&VolumeHeader{Magic: HeaderMagic, Format: future, Archive: "test-archive", Volume: "LTO001"},
+			"newer kura"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, 4<<20, plan.Layout{})
+			vol, done := f.mount("drive")
+			// The archive header has to be sound for a volume-header case to
+			// be reached at all: Reconcile checks archive identity first, so
+			// that a foreign cartridge is never reported as a bad header.
+			if tc.object == HeaderObject {
+				if err := putJSON(ctx, vol, ArchiveObject, &ArchiveHeader{
+					Magic: ArchiveMagic, Format: HeaderFormat, Archive: "test-archive",
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := putJSON(ctx, vol, tc.object, tc.header); err != nil {
+				t.Fatal(err)
+			}
+			done()
+
+			vol, done = f.mount("drive")
+			defer done()
+			_, err := Reconcile(ctx, vol, "test-archive", "LTO001", 1, false)
+			if err == nil {
+				t.Fatal("Reconcile accepted it")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// An encrypted archive is refused rather than half-read. The header declares
+// how its objects were written, and a build that cannot do that must say so
+// instead of handing back ciphertext as though it were data.
+func TestAnEncryptedArchiveIsRefusedForNow(t *testing.T) {
+	f := newFixture(t, 4<<20, plan.Layout{})
+	ctx := context.Background()
+
+	vol, done := f.mount("drive")
+	if err := putJSON(ctx, vol, ArchiveObject, &ArchiveHeader{
+		Magic: ArchiveMagic, Format: HeaderFormat, Archive: "test-archive",
+		Encrypted: true, Cipher: "aes-256-gcm",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	done()
+
+	vol, done = f.mount("drive")
+	defer done()
+	_, err := Reconcile(ctx, vol, "test-archive", "LTO001", 1, false)
+	if err == nil || !strings.Contains(err.Error(), "encrypt") {
+		t.Fatalf("an encrypted archive should be refused plainly, got %v", err)
+	}
+}
+
+// A cartridge written by another machine at a later generation is ahead of this
+// catalog, and adopting it means comparing the volume's own catalog against the
+// local one — which is not built. Stopping is the correct answer (DESIGN §11),
+// and it has to be distinguishable from the wrong cartridge.
+func TestAVolumeAheadOfTheCatalogStopsRatherThanGuessing(t *testing.T) {
+	f := newFixture(t, 4<<20, plan.Layout{})
+	f.write(map[string]int{"a.bin": 2048})
+	p := f.plan()
+	ctx := context.Background()
+
+	// Generation 3 on the medium, against a run that thinks it is at 1.
+	vol, done := f.mount("drive")
+	if _, err := Write(ctx, vol, p.Volumes[0], f.cat, Options{
+		Archive: f.cat.Header.Archive, Generation: 3,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	done()
+
+	vol, done = f.mount("drive")
+	defer done()
+	_, err := Reconcile(ctx, vol, f.cat.Header.Archive, p.Volumes[0].ID, 1, false)
+	if err == nil {
+		t.Fatal("a volume ahead of the catalog was accepted for writing")
+	}
+	if !strings.Contains(err.Error(), "ahead of the catalog") {
+		t.Errorf("the error should say the volume is ahead: %v", err)
+	}
+}
+
+// A header that names no volume cannot identify the cartridge it sits on, and
+// there is no longer a mount point to fall back on. Catching it here keeps an
+// empty string from propagating into catalog records as a volume ID, where it
+// would quietly match nothing for the rest of the archive's life.
+func TestAHeaderNamingNoVolumeIsRefused(t *testing.T) {
+	f := newFixture(t, 4<<20, plan.Layout{})
+	ctx := context.Background()
+
+	vol, done := f.mount("drive")
+	if err := putJSON(ctx, vol, HeaderObject, &VolumeHeader{
+		Magic: HeaderMagic, Format: HeaderFormat, Archive: "test-archive",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	done()
+
+	vol, done = f.mount("drive")
+	defer done()
+	_, err := ReadHeader(ctx, vol)
+	if err == nil {
+		t.Fatal("a header naming no volume was accepted")
+	}
+	if errors.Is(err, ErrBlank) {
+		t.Error("a header that is present but nameless is corrupt, not blank")
+	}
+	if !strings.Contains(err.Error(), "names no volume") {
+		t.Errorf("the error should say the header names no volume: %v", err)
+	}
+}
+
+// The refusal has to hold through Write, not just through Reconcile on its own:
+// Write is what the operator actually reaches, and it must stop before placing
+// a single object on a cartridge the plan did not ask for.
+func TestWriteRefusesACartridgeThePlanDidNotAskFor(t *testing.T) {
+	f := newFixture(t, 4<<20, plan.Layout{})
+	ctx := context.Background()
+
+	vol, done := f.mount("drive")
+	if _, err := Reconcile(ctx, vol, "test-archive", "LTO001", 1, false); err != nil {
+		t.Fatal(err)
+	}
+	done()
+
+	vol, done = f.mount("drive")
+	defer done()
+	_, err := Write(ctx, vol, &plan.Volume{ID: "LTO002"}, f.cat, Options{
+		Archive: "test-archive", Generation: 1,
+	})
+	if err == nil {
+		t.Fatal("Write accepted a cartridge the plan did not ask for")
+	}
+	if !strings.Contains(err.Error(), "LTO001") || !strings.Contains(err.Error(), "LTO002") {
+		t.Errorf("the error should name the cartridge that is in and the one wanted: %v", err)
+	}
+}
+
+// Reading a blank cartridge says so, rather than failing on some later detail.
+// The operator who put a fresh cartridge in and asked for a scrub needs to be
+// told that, not handed a header error.
+func TestReadingABlankVolumeSaysItIsBlank(t *testing.T) {
+	f := newFixture(t, 4<<20, plan.Layout{})
+	ctx := context.Background()
+	vol, done := f.mount("drive")
+	defer done()
+
+	if _, err := Verify(ctx, vol, f.cat, false); !errors.Is(err, ErrBlank) {
+		t.Errorf("Verify on a blank volume: %v, want ErrBlank", err)
+	}
+	if _, err := Restore(ctx, vol, f.cat, 1, t.TempDir(), false); !errors.Is(err, ErrBlank) {
+		t.Errorf("Restore on a blank volume: %v, want ErrBlank", err)
+	}
+}
+
+// The same argument as the archive ID, for the volume ID. A blank cartridge has
+// no identity of its own and the mount point is not one either, so with nothing
+// to name it there is no volume it could become.
+func TestReconcileRefusesAnEmptyVolumeID(t *testing.T) {
+	f := newFixture(t, 4<<20, plan.Layout{})
+	vol, done := f.mount("slot-1")
+	defer done()
+
+	if _, err := Reconcile(context.Background(), vol, "test-archive", "", 1, false); err == nil {
+		t.Fatal("Reconcile accepted an empty volume ID")
 	}
 }
 

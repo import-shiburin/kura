@@ -29,13 +29,15 @@
         machine.succeed("test -e /dev/disk/by-id/virtio-kura-slot-2")
         machine.log(machine.succeed("lsblk -o NAME,SIZE,SERIAL"))
 
-    with subtest("a cartridge can be formatted, loaded under a volume ID, and ejected"):
+    with subtest("a cartridge can be formatted, loaded, and ejected"):
+        # One drive, one path, whatever is in it. The mount point says nothing
+        # about which volume this is; that is read from the medium.
         blank(machine, 1)
-        mount = load(machine, 1, "LTO001")
-        assert mount == "/mnt/lto/LTO001", f"mounted at {mount}"
-        machine.succeed("mountpoint -q /mnt/lto/LTO001")
+        mount = load(machine, 1)
+        assert mount == "/mnt/lto", f"mounted at {mount}"
+        machine.succeed("mountpoint -q /mnt/lto")
         unload(machine)
-        machine.fail("mountpoint -q /mnt/lto/LTO001")
+        machine.fail("mountpoint -q /mnt/lto")
 
     with subtest("the fixture generator is deterministic across trees"):
         make_source(machine, spec="tiny=8,small=4", seed=7, root="/tmp/a")
@@ -60,6 +62,16 @@
         assert_contains(kura(machine, "write", check=False), "required", "write with no flags")
         assert_contains(kura(machine, "verify", check=False), "required", "verify with no flags")
         assert_contains(kura(machine, "restore", check=False), "required", "restore with no flags")
+
+    with subtest("restoring from a catalog that holds nothing says so"):
+        # A missing catalog loads as an empty one rather than failing, so this
+        # is the first run's most likely mistake: the operator restores before
+        # anything has been written. It has to name the reason, not the file.
+        out = kura(
+            machine, "restore", "-catalog", "/var/lib/kura/nothing-here.jsonl.gz",
+            "-mount", "/tmp/no-such-mount", "-into", "/tmp/nowhere", check=False,
+        )
+        assert_contains(out, "nothing to restore", "empty catalog")
 
     with subtest("per-command help lists that command's flags"):
         for cmd in ["plan", "write", "verify", "restore", "volumes", "history", "at-gen"]:
@@ -114,8 +126,8 @@
 
     with subtest("volumes flags an overdue verification"):
         blank(machine, 1)
-        write_volume(machine, 1, volumes[0], "-quiet")
-        assert_contains(verify_volume(machine, 1, volumes[0]), "Clean.", "verify")
+        write_volume(machine, 1, "-quiet")
+        assert_contains(verify_volume(machine, 1), "Clean.", "verify")
 
         # A zero window makes a volume verified a moment ago already overdue,
         # which is the only way to reach that branch without waiting months.
@@ -128,8 +140,8 @@
 
     with subtest("a dry run touches nothing"):
         blank(machine, 2)
-        mount = load(machine, 2, volumes[0])
-        kura(machine, "write", "-plan", PLAN, "-catalog", CATALOG, "-drive", mount,
+        mount = load(machine, 2)
+        kura(machine, "write", "-plan", PLAN, "-catalog", CATALOG, "-mount", mount,
              "-volume", volumes[0], "-dry-run", "-quiet")
         # Counted the way the backend counts: files only, minus its own staging
         # directory. A real ext4 cartridge also carries an empty lost+found from

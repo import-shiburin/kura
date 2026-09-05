@@ -61,22 +61,24 @@ def blank(machine, slot):
     machine.succeed(f"cartridge blank {slot}")
 
 
-def load(machine, slot, volume_id):
-    """Insert the cartridge in `slot` and present it as `volume_id`.
+def load(machine, slot):
+    """Insert the cartridge from `slot` into the drive, and return the mount.
 
-    Slot and volume ID are separate arguments on purpose. They are the same
-    thing only when the operator loads the right cartridge, and the scenarios
-    that matter are the ones where they are not.
+    Only the slot is named, because that is all the operator controls. Which
+    volume the cartridge turns out to be is written on it, and the mount point
+    is the same path every time — a drive is one path, and the tool has to
+    identify the medium without help from it.
     """
-    return machine.succeed(f"cartridge load {slot} {volume_id}").strip()
+    return machine.succeed(f"cartridge load {slot}").strip()
 
 
 def unload(machine):
     machine.succeed("cartridge unload")
 
 
-def free_bytes(machine, volume_id):
-    return int(machine.succeed(f"cartridge free {volume_id}").strip())
+def free_bytes(machine):
+    """Free space on whatever cartridge is currently loaded."""
+    return int(machine.succeed("cartridge free").strip())
 
 
 def restored_path(into, source=STORAGE):
@@ -205,41 +207,47 @@ def delta_counts(report):
     return counts
 
 
-def write_volume(machine, slot, volume_id, *extra):
+def write_volume(machine, slot, *extra, check=True):
     """The operator's inner loop: load a cartridge, write one volume, eject.
 
     Each write is its own process that exits before the next cartridge goes in.
     That is the contract the whole tool is built around — no process is held
     open across a swap — so the harness performs it literally rather than
     calling write twice against one mount.
+
+    No volume ID: which volume this becomes is the plan's decision for a blank
+    cartridge, and the medium's own answer for one that has been written. Pass
+    `-volume X` through `extra` to write a particular volume of the plan.
     """
-    mount = load(machine, slot, volume_id)
-    out = kura(machine, "write", "-plan", PLAN, "-catalog", CATALOG, "-drive", mount, *extra)
+    mount = load(machine, slot)
+    out = kura(machine, "write", "-plan", PLAN, "-catalog", CATALOG, "-mount", mount, *extra, check=check)
     unload(machine)
     return out
 
 
-def verify_volume(machine, slot, volume_id, *extra, check=True):
-    mount = load(machine, slot, volume_id)
-    out = kura(machine, "verify", "-catalog", CATALOG, "-drive", mount, *extra, check=check)
+def verify_volume(machine, slot, *extra, check=True):
+    mount = load(machine, slot)
+    out = kura(machine, "verify", "-catalog", CATALOG, "-mount", mount, *extra, check=check)
     unload(machine)
     return out
 
 
-def restore_volume(machine, slot, volume_id, into, *extra, check=True):
-    mount = load(machine, slot, volume_id)
+def restore_volume(machine, slot, into, *extra, check=True):
+    mount = load(machine, slot)
     machine.succeed(f"mkdir -p {shlex.quote(into)}")
-    out = kura(machine, "restore", "-catalog", CATALOG, "-drive", mount, "-into", into, *extra, check=check)
+    out = kura(machine, "restore", "-catalog", CATALOG, "-mount", mount, "-into", into, *extra, check=check)
     unload(machine)
     return out
 
 
-def write_all(machine, slots, volume_ids, *extra):
-    """Write every volume of a plan, one cartridge at a time."""
-    outs = []
-    for slot, vid in zip(slots, volume_ids):
-        outs.append(write_volume(machine, slot, vid, *extra))
-    return outs
+def write_all(machine, slots, *extra):
+    """Write every volume of a plan, one cartridge at a time.
+
+    The plan's volume order and the slot order are the operator's to line up;
+    each write takes the first volume not yet written, so a blank cartridge in
+    each slot produces the plan's volumes in sequence.
+    """
+    return [write_volume(machine, slot, *extra) for slot in slots]
 
 
 def collect_coverage(machine):

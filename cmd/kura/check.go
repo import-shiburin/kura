@@ -12,19 +12,26 @@ import (
 	"kura/internal/archive"
 	"kura/internal/catalog"
 	"kura/internal/plan"
+	"kura/internal/volume"
 )
 
 func runVerify(argv []string) {
 	fs := flag.NewFlagSet("verify", flag.ExitOnError)
 	var (
 		catalogPath = fs.String("catalog", "", "catalog to check against and update (required)")
-		drive       = fs.String("drive", "", "directory standing in for the loaded volume (required)")
+		mount       = fs.String("mount", "", "where the loaded volume is mounted (required)")
+		volumeID    = fs.String("volume", "", "refuse to run unless the loaded volume is this one")
 		noMark      = fs.Bool("no-mark", false, "report failures without recording them in the catalog")
 	)
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, `kura verify - read one volume back and check it against its digests
 
-  kura verify -catalog catalog.jsonl.gz -drive /mnt/lto/LTO001
+  kura verify -catalog catalog.jsonl.gz -mount /mnt/lto
+
+Checks whichever volume is loaded: which one that is comes from the medium's own
+kura.volume.json, not from where it happens to be mounted. Pass -volume to make
+that an assertion instead, for a script that means to scrub a particular
+cartridge and should stop if the wrong one went in.
 
 Reads every object the catalog says this volume holds and compares it against
 the digest recorded when it was written. Nothing below this tool reports a
@@ -40,8 +47,8 @@ Flags:
 	}
 	fs.Parse(argv)
 
-	if *catalogPath == "" || *drive == "" {
-		fmt.Fprintln(os.Stderr, "error: -catalog and -drive are both required")
+	if *catalogPath == "" || *mount == "" {
+		fmt.Fprintln(os.Stderr, "error: -catalog and -mount are both required")
 		fs.Usage()
 		os.Exit(2)
 	}
@@ -51,13 +58,13 @@ Flags:
 		fatal(err)
 	}
 	ctx := context.Background()
-	backend, vol, err := openDrive(ctx, *drive, 0)
+	backend, vol, err := openDrive(ctx, *mount, 0)
 	if err != nil {
 		fatal(err)
 	}
 	defer backend.Release(ctx)
 
-	fmt.Fprintf(os.Stderr, "verifying %s ...\n", vol.ID())
+	fmt.Fprintf(os.Stderr, "verifying %s ...\n", loadedVolume(ctx, vol, *volumeID))
 	res, err := archive.Verify(ctx, vol, cat, !*noMark)
 	if err != nil {
 		fatal(err)
@@ -109,7 +116,8 @@ func runRestore(argv []string) {
 	fs := flag.NewFlagSet("restore", flag.ExitOnError)
 	var (
 		catalogPath = fs.String("catalog", "", "catalog to restore from (required)")
-		drive       = fs.String("drive", "", "directory standing in for the loaded volume (required)")
+		mount       = fs.String("mount", "", "where the loaded volume is mounted (required)")
+		volumeID    = fs.String("volume", "", "refuse to run unless the loaded volume is this one")
 		into        = fs.String("into", "", "directory to restore into (required)")
 		atGen       = fs.Int("at-gen", 0, "generation to reconstruct; default is the newest")
 		noVerify    = fs.Bool("no-verify", false, "skip digest checking as files are written")
@@ -117,7 +125,10 @@ func runRestore(argv []string) {
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, `kura restore - write out what one volume holds
 
-  kura restore -catalog catalog.jsonl.gz -drive /mnt/lto/LTO001 -into /restore
+  kura restore -catalog catalog.jsonl.gz -mount /mnt/lto -into /restore
+
+Restores whichever volume is loaded, identified from its own kura.volume.json
+rather than from where it is mounted; -volume makes that an assertion.
 
 Restores the part of a generation that lives on the loaded volume, then says
 what is still outstanding and on which volumes. Run it again with each of those
@@ -130,8 +141,8 @@ Flags:
 	}
 	fs.Parse(argv)
 
-	if *catalogPath == "" || *drive == "" || *into == "" {
-		fmt.Fprintln(os.Stderr, "error: -catalog, -drive and -into are all required")
+	if *catalogPath == "" || *mount == "" || *into == "" {
+		fmt.Fprintln(os.Stderr, "error: -catalog, -mount and -into are all required")
 		fs.Usage()
 		os.Exit(2)
 	}
@@ -149,13 +160,13 @@ Flags:
 	}
 
 	ctx := context.Background()
-	backend, vol, err := openDrive(ctx, *drive, 0)
+	backend, vol, err := openDrive(ctx, *mount, 0)
 	if err != nil {
 		fatal(err)
 	}
 	defer backend.Release(ctx)
 
-	fmt.Fprintf(os.Stderr, "restoring generation %d from %s into %s ...\n", gen, vol.ID(), *into)
+	fmt.Fprintf(os.Stderr, "restoring generation %d from %s into %s ...\n", gen, loadedVolume(ctx, vol, *volumeID), *into)
 	res, err := archive.Restore(ctx, vol, cat, gen, *into, !*noVerify)
 	if err != nil {
 		fatal(err)
@@ -263,8 +274,30 @@ func runVolumes(argv []string) {
 		// A full scrub cannot be one command that runs for days, so the useful
 		// question is which volume to put in the drive next (DESIGN §8).
 		fmt.Printf("\n  Most overdue first: %v\n", due)
-		fmt.Printf("  kura verify -catalog ... -drive <the one holding %s>\n", due[0])
+		fmt.Printf("  kura verify -catalog ... -mount <where you loaded %s>\n", due[0])
 	}
+}
+
+// loadedVolume names the cartridge in the drive, and stops if it is not the one
+// the caller asked for.
+//
+// Verify and Restore work on whatever is loaded, so unlike write there is no
+// plan to check against — want is optional and comes from -volume, for a script
+// that meant a particular cartridge. A blank volume stops here rather than
+// inside the operation, which would otherwise report a header error for what is
+// really an empty drive.
+func loadedVolume(ctx context.Context, vol volume.Volume, want string) string {
+	id, err := archive.VolumeIDOn(ctx, vol)
+	if err != nil {
+		fatal(err)
+	}
+	switch {
+	case id == "":
+		fatal(fmt.Errorf("the loaded volume is blank; there is nothing on it to read"))
+	case want != "" && id != want:
+		fatal(fmt.Errorf("the drive holds volume %s but -volume asked for %s", id, want))
+	}
+	return id
 }
 
 func orDash(s string) string {

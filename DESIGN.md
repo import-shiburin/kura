@@ -143,6 +143,33 @@ The medium's own format already works this way: LTFS writes each index with a
 generation number, keeps the older ones, and can roll back to them. Following
 it costs nothing and makes a cartridge readable at any generation it holds.
 
+**`kura.volume.json` is the only answer to "which cartridge is this?"** Nothing
+outside the volume knows. A drive is one fixed mount point — `/mnt/lto`, every
+time — and what is in it is whatever the operator pushed in a moment ago; the
+path is a property of the drive, not of the medium. There is no barcode to read
+either, at least not through a filesystem, and a library that can report one is
+an upgrade to this answer rather than a replacement for it.
+
+This was got wrong once, and the shape of the mistake is worth keeping. The file
+backend answered `ID()` with its directory's base name, so the wrong-cartridge
+check compared the header against the mount path. Both sides came from the same
+string, so the check could only agree with itself: it passed when the operator
+had already named the mount point after the cartridge they believed was in, and
+so confirmed that belief rather than testing it. Mounted at the obvious
+`/mnt/lto`, every written cartridge was refused instead.
+
+The check that replaces it compares the medium against **the plan**, and the two
+cases divide cleanly:
+
+| Cartridge | Where identity comes from |
+|---|---|
+| Written | its own header — and disagreeing with the plan is a wrong cartridge, refused |
+| Blank | the plan, which stamps it; nothing else can name a fresh volume |
+
+`verify` and `restore` have no plan, and want none: a scrub reads whatever is
+loaded, and the header both names it and is the only thing to name it. `-volume`
+turns that into an assertion for a script that meant a particular cartridge.
+
 Losing `generation` and `written` from the header costs nothing that mattered.
 They were there so twenty encrypted cartridges would not be twenty identical
 bricks — and the generation directories answer that better, because how far a
@@ -688,7 +715,7 @@ recovery one.
 One binary, subcommands:
 
 ```
-kura init     --source /storage --backend ltfs --encrypt=contents
+kura init     --source /storage --encrypt=contents
 kura plan     --snapshot auto-2026-09-02
 kura write    --volume LTO014        # one volume, then exits
 kura verify   --volume LTO007        # or --overdue
@@ -716,6 +743,70 @@ having somewhere to look**. A pluggable notifier earns its place before any GUI.
 When a GUI does arrive, a TUI fits better than a web app — the operator is at a
 terminal beside the drive, and it avoids a browser dependency on a NAS reached
 over SSH.
+
+### 10.1 Reaching the medium: `-mount`, and `-device` for tape alone
+
+`-drive` was the first name for the path a volume is mounted at, and it was
+wrong in both directions. Every other flag names the value it takes — `-plan` a
+plan file, `-catalog` a catalog, `-into` a directory — while `-drive` named the
+hardware at the far end of its argument, and this document uses "drive" for the
+machine throughout (§8.1: "try a different drive"). One word was carrying two
+things, and the one it was attached to was the one it did not mean.
+
+**`-mount` is where the loaded volume is mounted.** For a shelf of disks it is
+the only flag there is. **`-device` is the drive itself**, and exists for LTFS
+alone.
+
+| Flags | Who mounts | On exit |
+|---|---|---|
+| `-mount /mnt/lto` | the operator | kura leaves the mount alone |
+| `-device /dev/sg0` | kura, into a private directory | unmounts; `-eject` also unloads |
+
+One rule covers it: **whoever mounted it unmounts it.** `-eject` alongside
+`-mount` is refused rather than obeyed, because kura did not make that mount and
+will not take it away.
+
+**kura never mounts a block device.** Given only a device it cannot know the
+filesystem. `mount(2)` — which is all a standard-library-only binary has — takes
+an explicit type; `-t auto` lives in mount(8) and libblkid, not in the syscall,
+so detection would mean reimplementing superblock probing. The partition map
+cannot stand in for it: MBR `0x83` and GPT `0FC63DAF-…` cover ext4, xfs and
+btrfs alike, and a disk formatted whole has no map to consult at all. Guessing
+wrong is not worth saving the operator one `mount`, so disks are adopt-only —
+a decision, not a stage on the way somewhere.
+
+Tape escapes this because **a tape is not a block device.** `/dev/nst0` is a
+SCSI character device with no partition map and no superblock, and `ltfs` is a
+FUSE daemon pointed at it. The filesystem is known before the flag is parsed,
+which is the one case where kura may run a mount itself.
+
+**Reading the fstype of an existing mount is a different act.** Refusing to
+probe a raw device is refusing to guess; reading `/proc/self/mountinfo` for a
+mount the kernel already made is reading a fact. kura needs that fact, because
+`Sync` on `fuse.ltfs` is an index flush and on ext4 it is fsync — the wrong one
+costs either an hour of fsyncs across 1.66 M objects, guarding against damage
+the mandatory verify pass catches anyway, or an index that never reaches the
+tape. *Unverified:* that mountinfo reports LTFS as `fuse.ltfs`; one
+`findmnt -o SOURCE,FSTYPE,MAJ:MIN /mnt/lto` against a mounted cartridge settles
+it.
+
+**Which is why there is no `--backend` flag.** The sketch above carried one and
+it is gone: `-mount` plus the fstype answers it, `-device` implies LTFS, and
+there was never a third option to choose between.
+
+**Finding the device from the mount does not work, and does not need to.** For a
+block filesystem mountinfo gives a real `major:minor` and source; a FUSE mount
+gets an anonymous `0:N` and a source string of the daemon's choosing, so the
+route fails precisely where a device is wanted. sysfs does work: both
+`/sys/class/scsi_tape/nst0/device` and `/sys/class/scsi_generic/sgN/device` are
+symlinks to the same SCSI `H:C:T:L` address, so two readlinks and a comparison
+pair a tape node with its sg node. A host with one drive has nothing to
+disambiguate, which leaves `-device` an override for a host with two rather than
+something an operator types.
+
+Discovery is not access — SG_IO still wants the privileges — and none of it
+touches §8.1's open question of whether the drive answers LOG SENSE at all while
+ltfs holds the mount.
 
 ---
 

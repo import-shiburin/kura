@@ -62,25 +62,29 @@ let
           mkfs.ext4 -q -F -m 0 -L "kura-slot-$2" "$dev"
           ;;
         load)
-          # $3 is the volume ID, and it becomes the mount point's base name
-          # because that is how kura identifies the loaded medium.
+          # One drive, one mount point, whichever cartridge is in it. The
+          # mount path says nothing about which volume this is — kura reads
+          # that from the medium's own kura.volume.json — and the harness must
+          # not imply otherwise. Mounting each cartridge at a path named after
+          # it is what let a circular identity check pass for so long: it
+          # compared the header against the mount point, so the swap scenarios
+          # were really testing that the harness had renamed a directory.
           dev=$(slot_dev "$2")
-          mkdir -p "$mount_root/$3"
-          mount "$dev" "$mount_root/$3"
-          echo "$mount_root/$3"
+          mkdir -p "$mount_root"
+          mount "$dev" "$mount_root"
+          echo "$mount_root"
           ;;
         unload)
           # Sync first: an unmount is the operator ejecting, and anything the
           # medium has not committed by then is gone.
+          # `|| true` because unload is called on paths that may already be
+          # unmounted, and a failing `&&` list is the last command in this case
+          # branch — under the harness's `set -e` that would fail the script.
           sync
-          for m in "$mount_root"/*; do
-            [ -d "$m" ] || continue
-            mountpoint -q "$m" && umount "$m"
-            rmdir "$m" 2>/dev/null || true
-          done
+          if mountpoint -q "$mount_root"; then umount "$mount_root"; fi || true
           ;;
         free)
-          df -B1 --output=avail "$mount_root/$2" | tail -1
+          df -B1 --output=avail "$mount_root" | tail -1
           ;;
         *)
           echo "usage: cartridge {blank|load|unload|free} ..." >&2

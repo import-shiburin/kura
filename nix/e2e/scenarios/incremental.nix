@@ -43,8 +43,8 @@
         gen1 = plan_volumes(machine)
         for slot, vid in enumerate(gen1, start=1):
             blank(machine, slot)
-            write_volume(machine, slot, vid)
-            assert_contains(verify_volume(machine, slot, vid), "Clean.", f"verify of {vid}")
+            write_volume(machine, slot)
+            assert_contains(verify_volume(machine, slot), "Clean.", f"verify of {vid}")
 
     with subtest("re-planning an unchanged tree finds nothing to write"):
         out = kura(
@@ -100,8 +100,8 @@
         slot = len(gen1) + 1
         for vid in gen2:
             blank(machine, slot)
-            write_volume(machine, slot, vid)
-            assert_contains(verify_volume(machine, slot, vid), "Clean.", f"verify of {vid}")
+            write_volume(machine, slot)
+            assert_contains(verify_volume(machine, slot), "Clean.", f"verify of {vid}")
             slot += 1
 
     with subtest("history records both generations"):
@@ -136,10 +136,11 @@
         # deleted files were still current records, so a restore of the newest
         # generation put them back. A restore has to reproduce the tree, not
         # the union of every tree there has ever been.
+        # Every cartridge in turn; each restore produces whatever the volume
+        # in the drive happens to hold.
         all_slots = list(range(1, slot))
-        all_volumes = gen1 + gen2
-        for s, vid in zip(all_slots, all_volumes):
-            restore_volume(machine, s, vid, "/tmp/restore-now")
+        for s in all_slots:
+            restore_volume(machine, s, "/tmp/restore-now")
         assert_trees_identical(machine, STORAGE, restored_path("/tmp/restore-now"))
 
         for gone in changes2["deleted"]:
@@ -149,8 +150,8 @@
         # The deleted files come back, the modified ones come back with their
         # old bytes, and the ones added afterwards are absent. That is what a
         # generation is for.
-        for s, vid in zip(all_slots, all_volumes):
-            restore_volume(machine, s, vid, "/tmp/restore-gen1", "-at-gen", "1")
+        for s in all_slots:
+            restore_volume(machine, s, "/tmp/restore-gen1", "-at-gen", "1")
         assert_trees_identical(machine, GEN1_COPY, restored_path("/tmp/restore-gen1"))
   '';
 }

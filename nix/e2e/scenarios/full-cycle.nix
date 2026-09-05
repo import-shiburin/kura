@@ -50,15 +50,15 @@
         machine.log(f"plan: {volumes}")
 
     with subtest("each volume is written by its own process, with a swap in between"):
-        for slot, vid in enumerate(volumes, start=1):
+        for slot in range(1, len(volumes) + 1):
             blank(machine, slot)
-            write_volume(machine, slot, vid)
+            write_volume(machine, slot)
         # Nothing is mounted between runs, so nothing could have been held open
         # across the swap.
-        machine.fail("mountpoint -q /mnt/lto/" + volumes[0])
+        machine.fail("mountpoint -q /mnt/lto")
 
     with subtest("the on-media layout is what DESIGN describes"):
-        mount = load(machine, 1, volumes[0])
+        mount = load(machine, 1)
         listing = machine.succeed(f"cd {mount} && find . -maxdepth 2 | sort")
         assert_contains(listing, "./kura.archive.json", "archive header")
         assert_contains(listing, "./kura.volume.json", "volume header")
@@ -90,7 +90,7 @@
         unload(machine)
 
     with subtest("small files went into containers, large files did not"):
-        mount = load(machine, 1, volumes[0])
+        mount = load(machine, 1)
         containers = machine.succeed(f"find {mount}/containers -name '*.tar' | wc -l").strip()
         assert int(containers) > 0, "no tar containers were written"
         unload(machine)
@@ -103,7 +103,7 @@
 
     with subtest("every volume reads back clean"):
         for slot, vid in enumerate(volumes, start=1):
-            out = verify_volume(machine, slot, vid)
+            out = verify_volume(machine, slot)
             assert_contains(out, "Clean.", f"verify of {vid}")
 
     with subtest("verification is recorded, so the inventory stops nagging"):
@@ -111,8 +111,8 @@
         assert "never" not in out, f"a volume is still unverified after a full pass:\n{out}"
 
     with subtest("restoring every volume reproduces the tree byte for byte"):
-        for slot, vid in enumerate(volumes, start=1):
-            restore_volume(machine, slot, vid, "/tmp/restored")
+        for slot in range(1, len(volumes) + 1):
+            restore_volume(machine, slot, "/tmp/restored")
         assert_trees_identical(machine, STORAGE, restored_path("/tmp/restored"))
 
     with subtest("history shows the one generation this cycle made"):
@@ -126,7 +126,7 @@
         # only the first cycle. Silent, because nothing reads the on-volume
         # catalog back until the local one is gone — the one moment it has to
         # be right.
-        mount = load(machine, 1, volumes[0])
+        mount = load(machine, 1)
         before = machine.succeed(f"sha256sum {mount}/generations/g0001/catalog.000.jsonl.gz").split()[0]
         unload(machine)
 
@@ -137,9 +137,12 @@
             "-capacity", "96MB", "-max-group", "64MB", "-start", 1,
         )
         later = plan_volumes(machine)
-        write_volume(machine, 1, later[0], "-quiet")
+        assert later[0] == volumes[0], (
+            f"generation 2 should append to {volumes[0]}, but plans to start at {later[0]}"
+        )
+        write_volume(machine, 1, "-quiet")
 
-        mount = load(machine, 1, later[0])
+        mount = load(machine, 1)
         generations = machine.succeed(f"ls {mount}/generations").split()
         after = machine.succeed(f"sha256sum {mount}/generations/g0001/catalog.000.jsonl.gz").split()[0]
         unload(machine)
@@ -152,7 +155,7 @@
         assert before == after, "appending generation 2 rewrote generation 1's catalog"
 
     with subtest("the appended volume still verifies and restores"):
-        assert_contains(verify_volume(machine, 1, later[0]), "Clean.", "verify after appending")
-        restore_volume(machine, 1, later[0], "/tmp/appended")
+        assert_contains(verify_volume(machine, 1), "Clean.", "verify after appending")
+        restore_volume(machine, 1, "/tmp/appended")
   '';
 }

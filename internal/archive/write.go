@@ -103,7 +103,13 @@ func Write(ctx context.Context, vol volume.Volume, pv *plan.Volume, cat *catalog
 	if opt.Generation < 1 {
 		return nil, fmt.Errorf("archive: generation must be 1 or greater, got %d", opt.Generation)
 	}
-	if _, err := Reconcile(ctx, vol, opt.Archive, opt.Generation, opt.DryRun); err != nil {
+	// The plan names the volume this is meant to be, and Reconcile hands back
+	// the header that settles what it actually is: stamped from pv.ID when the
+	// cartridge was blank, read off the medium when it was not. Every record
+	// below takes its volume ID from there rather than from the drive, which
+	// knows nothing about which cartridge the operator pushed in.
+	h, err := Reconcile(ctx, vol, opt.Archive, pv.ID, opt.Generation, opt.DryRun)
+	if err != nil {
 		return nil, err
 	}
 
@@ -112,7 +118,7 @@ func Write(ctx context.Context, vol volume.Volume, pv *plan.Volume, cat *catalog
 		return nil, err
 	}
 
-	w := &writer{vol: vol, opt: opt, present: present, res: &Result{Volume: vol.ID()}}
+	w := &writer{vol: vol, id: h.Volume, opt: opt, present: present, res: &Result{Volume: h.Volume}}
 
 	// Entries is the authoritative list: the grouped Items view does not carry
 	// its files through the plan file, and reading both would write everything
@@ -152,7 +158,7 @@ func Write(ctx context.Context, vol volume.Volume, pv *plan.Volume, cat *catalog
 	// something has to.
 	cat.Add(w.res.Records...)
 	cat.Header.Generation = max(cat.Header.Generation, opt.Generation)
-	info := cat.Header.Volume(vol.ID())
+	info := cat.Header.Volume(w.id)
 	if info.Written == "" {
 		info.Written = time.Now().UTC().Format(time.RFC3339)
 	}
@@ -166,14 +172,20 @@ func Write(ctx context.Context, vol volume.Volume, pv *plan.Volume, cat *catalog
 		// Put leaves objects atomically visible but not necessarily on the
 		// platter. This is the point the volume becomes safe to eject.
 		if err := vol.Sync(ctx); err != nil {
-			return nil, fmt.Errorf("syncing %s: %w", vol.ID(), err)
+			return nil, fmt.Errorf("syncing %s: %w", w.id, err)
 		}
 	}
 	return w.res, nil
 }
 
 type writer struct {
-	vol     volume.Volume
+	vol volume.Volume
+
+	// id is what the medium says it is, from the header Reconcile returned.
+	// Held here rather than asked of vol because a volume has no identity to
+	// give: see the note on volume.Volume.
+	id string
+
 	opt     Options
 	present map[string]int64 // objects already on the volume, by name
 	res     *Result
@@ -249,7 +261,7 @@ func (w *writer) object(ctx context.Context, e plan.Entry) error {
 func (w *writer) resumeObject(ctx context.Context, e plan.Entry, name string) (*catalog.Record, error) {
 	if w.present[name] != e.Size {
 		return nil, fmt.Errorf("%s on %s is %d bytes, the plan says %d: refusing to guess which is right",
-			name, w.vol.ID(), w.present[name], e.Size)
+			name, w.id, w.present[name], e.Size)
 	}
 	sampled, full, err := digestObject(ctx, w.vol, name, e.Size)
 	if err != nil {
@@ -369,7 +381,7 @@ func (w *writer) resumeContainer(ctx context.Context, name string, files []plan.
 			// refuses to overwrite, and guessing which is right is exactly the
 			// mistake that loses data.
 			return fmt.Errorf("container %s on %s does not hold %s, which the plan says it should",
-				name, w.vol.ID(), e.Path)
+				name, w.id, e.Path)
 		}
 		info, err := os.Stat(e.ReadFrom())
 		if err != nil {
@@ -396,7 +408,7 @@ func (w *writer) fragment(ctx context.Context, e plan.Entry) error {
 		ModTime: e.ModTime,
 		Gen:     w.opt.Generation,
 	}
-	part := catalog.Part{Volume: w.vol.ID(), Object: name, Offset: e.Offset, Length: e.Length}
+	part := catalog.Part{Volume: w.id, Object: name, Offset: e.Offset, Length: e.Length}
 
 	if _, done := w.present[name]; done {
 		_, full, err := digestObject(ctx, w.vol, name, e.Length)
@@ -451,7 +463,7 @@ func (w *writer) record(e plan.Entry, info os.FileInfo, object, container, sampl
 		Hash:      sampled,
 		HashKind:  catalog.HashKindSample,
 		FullHash:  full,
-		Volume:    w.vol.ID(),
+		Volume:    w.id,
 		Object:    object,
 		Container: container,
 		Gen:       w.opt.Generation,

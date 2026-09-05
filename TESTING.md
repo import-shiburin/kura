@@ -177,8 +177,8 @@ story and not the plumbing.
 | `kura(machine, *args, check=True)` | run it; `check=False` asserts it *fails* |
 | `kura_status(machine, *args)` | `(status, output)`, no assertion either way |
 | `make_source(machine, spec=, seed=)` | a deterministic tree shaped like the real archive |
-| `blank / load / unload` | format a cartridge, insert it under a volume ID, eject |
-| `write_volume / verify_volume / restore_volume` | load, run one command, eject |
+| `blank / load / unload` | format the cartridge in a slot, insert it, eject |
+| `write_volume / verify_volume / restore_volume` | load a slot, run one command, eject |
 | `plan_volumes(machine)` | the volume IDs a plan lays out |
 | `delta_counts(report)` | the DELTA table as numbers |
 | `assert_trees_identical(machine, a, b)` | `diff -r`, so a failure names the file |
@@ -221,9 +221,16 @@ never by kernel device order. `/dev/vdb` happening to be slot 1 is true today
 and is not a promise, and a scenario that silently formats the wrong disk is an
 expensive afternoon.
 
-`load(machine, slot, volume_id)` takes both because they are the same thing only
-when the operator loads the right cartridge, and the interesting scenarios are
-the ones where they are not.
+`load(machine, slot)` takes only the slot, and every cartridge mounts at the
+same `/mnt/lto`. That is not a simplification, it is the property under test: a
+drive is one path and holds whatever was pushed into it, so kura has to work out
+which volume it is holding from the medium alone.
+
+The harness used to mount each cartridge at `/mnt/lto/<volume-id>`, and the
+wrong-cartridge check compared the volume's header against that path — so it
+agreed with itself, and the swap scenarios were really asserting that the
+harness had renamed a directory. If a scenario ever needs a per-volume mount
+point again, that is the bug coming back.
 
 ### Scaling
 
@@ -254,7 +261,7 @@ helper in scope.
 |---|---|
 | `smoke` | the harness itself: cartridges appear, kura runs, counters come back. Also every argument-error path, which all end in `os.Exit`. |
 | `full-cycle` | plan, write across cartridges with real ejects, verify, restore, compare byte for byte. Checks the on-media layout against DESIGN. |
-| `cartridge-swap` | the wrong cartridge, refused four ways: by header, by drive identity, by a volume the plan lacks, and as a foreign archive. |
+| `cartridge-swap` | one drive, one mount point, the wrong cartridge in it. Identity read off the medium across a swap; refusals for a cartridge the plan did not ask for, a volume the plan lacks, a foreign archive, a `-volume` assertion that fails, and a blank cartridge. |
 | `bitrot` | a byte flipped at a computed offset inside one tar member. Verify must blame that file and no other, mark it lost, and the next plan must re-source it. |
 | `incremental` | a second generation. Content changed behind an unchanged size *and* mtime, so only ctime differs; deletions and additions; restore of either generation. |
 | `capacity` | a plan that over-promises the medium. The refusal comes from the kernel, and nothing is recorded as written. |
@@ -293,7 +300,7 @@ make cover-gate                  # merges unit + e2e into coverage/all.profile
 make cover-ratchet               # raises every floor to what that reached
 ```
 
-### Three defects found so far, all fixed
+### Four defects found so far, all fixed
 
 Each is now a regression test in the scenario that found it.
 
@@ -325,3 +332,18 @@ describing only the first cycle. Silent, because nothing reads the on-volume
 catalog back until the local one is gone, which is the one moment it has to be
 right. Per-cycle metadata now lives under `generations/gNNNN/`, which is also
 what LTFS does with its own index.
+
+**The wrong-cartridge check agreed with itself** (`cartridge-swap`). A volume's
+ID came from its mount point's base name, so the check compared the medium's
+header against a string chosen by whoever ran `mount`. Loading the wrong
+cartridge was caught only when the operator had already named the mount point
+after the cartridge they believed was in — and at the obvious `/mnt/lto`, every
+written cartridge was refused instead. Identity now comes from
+`kura.volume.json` and the check is against the plan.
+
+This one is instructive in the opposite direction from the tombstone bug: the
+scenario existed, was thorough, and passed. It mounted each cartridge at
+`/mnt/lto/<volume-id>`, so the harness supplied the very answer the tool was
+supposed to derive. A test that hands over the answer will pass over any
+implementation, including one that cannot work on real hardware at all — which
+is why the harness now mounts everything at one fixed path.

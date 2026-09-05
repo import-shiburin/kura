@@ -55,14 +55,14 @@
         # the last subtest, which is about exactly that.
         for slot in range(1, len(volumes) + 1):
             blank(machine, slot)
-        write_volume(machine, 1, volumes[0], "-quiet")
+        write_volume(machine, 1, "-quiet")
         assert_contains(kura(machine, "volumes", "-catalog", CATALOG), volumes[0], "inventory")
 
     with subtest("a write killed mid-flight leaves objects but no catalog record"):
-        mount = load(machine, 2, volumes[1])
+        mount = load(machine, 2)
         start_background(
             machine,
-            f"kura write -plan {PLAN} -catalog {CATALOG} -drive {mount} -quiet -volume {volumes[1]}",
+            f"kura write -plan {PLAN} -catalog {CATALOG} -mount {mount} -quiet -volume {volumes[1]}",
             "/tmp/write1.pid",
             "/tmp/write1.log",
         )
@@ -83,15 +83,15 @@
     with subtest("re-running the same write resumes over what is already there"):
         # Put refuses to overwrite a name, so this only works if the writer
         # recognises its own earlier objects.
-        out = write_volume(machine, 2, volumes[1], "-quiet")
+        out = write_volume(machine, 2, "-quiet")
         assert "already exists" not in out, f"resume tried to rewrite an object:\n{out}"
-        assert_contains(verify_volume(machine, 2, volumes[1]), "Clean.", "verify after resume")
+        assert_contains(verify_volume(machine, 2), "Clean.", "verify after resume")
 
     with subtest("a power cut during the next volume is survivable"):
-        mount = load(machine, 3, volumes[2])
+        mount = load(machine, 3)
         start_background(
             machine,
-            f"kura write -plan {PLAN} -catalog {CATALOG} -drive {mount} -quiet -volume {volumes[2]}",
+            f"kura write -plan {PLAN} -catalog {CATALOG} -mount {mount} -quiet -volume {volumes[2]}",
             "/tmp/write2.pid",
             "/tmp/write2.log",
         )
@@ -105,12 +105,12 @@
         # The journal replays, the medium holds whatever was durable, and the
         # writer picks up from there. Nothing here asserts how much survived —
         # that is the medium's business — only that the archive converges.
-        write_volume(machine, 3, volumes[2], "-quiet")
-        assert_contains(verify_volume(machine, 3, volumes[2]), "Clean.", "verify after the power cut")
+        write_volume(machine, 3, "-quiet")
+        assert_contains(verify_volume(machine, 3), "Clean.", "verify after the power cut")
 
     with subtest("what came back is what went in"):
-        for slot, vid in enumerate(volumes, start=1):
-            restore_volume(machine, slot, vid, "/tmp/restored")
+        for slot in range(1, len(volumes) + 1):
+            restore_volume(machine, slot, "/tmp/restored")
         assert_trees_identical(machine, STORAGE, restored_path("/tmp/restored"))
 
     with subtest("an interrupted FIRST write can be finished, not orphaned"):
@@ -134,10 +134,10 @@
         fresh = plan_volumes(machine, FRESH_PLAN)
 
         blank(machine, 4)
-        mount = load(machine, 4, fresh[0])
+        mount = load(machine, 4)
         start_background(
             machine,
-            f"kura write -plan {FRESH_PLAN} -catalog {FRESH} -drive {mount} -quiet -volume {fresh[0]}",
+            f"kura write -plan {FRESH_PLAN} -catalog {FRESH} -mount {mount} -quiet -volume {fresh[0]}",
             "/tmp/write3.pid",
             "/tmp/write3.log",
         )
@@ -153,11 +153,11 @@
         )
 
         kura(machine, "write", "-plan", FRESH_PLAN, "-catalog", FRESH,
-             "-drive", mount, "-volume", fresh[0], "-quiet")
+             "-mount", mount, "-volume", fresh[0], "-quiet")
         unload(machine)
 
-        mount = load(machine, 4, fresh[0])
-        assert_contains(kura(machine, "verify", "-catalog", FRESH, "-drive", mount), "Clean.", "verify of the finished volume")
+        mount = load(machine, 4)
+        assert_contains(kura(machine, "verify", "-catalog", FRESH, "-mount", mount), "Clean.", "verify of the finished volume")
         unload(machine)
 
     with subtest("a catalog that lost its archive ID adopts the medium's"):
@@ -165,9 +165,9 @@
         # a catalog destroyed outright is repaired from any cartridge rather
         # than minting a second identity for an archive that already has one.
         machine.succeed(f"rm {FRESH}")
-        mount = load(machine, 4, fresh[0])
+        mount = load(machine, 4)
         out = kura(machine, "write", "-plan", FRESH_PLAN, "-catalog", FRESH,
-                   "-drive", mount, "-volume", fresh[0], "-quiet")
+                   "-mount", mount, "-volume", fresh[0], "-quiet")
         unload(machine)
         assert_contains(out, "adopting archive " + stamped["archive"], "adoption from the medium")
   '';

@@ -95,15 +95,15 @@ restore.
 
 | | |
 |---|---|
-| `internal/volume` + `filevol` | the backend seam and directory-as-volume — 17 tests |
+| `internal/volume` + `filevol` | the backend seam and directory-as-volume — 16 tests |
 | `internal/catalog` | records, history queries, `Lost`, `Tombstone`, per-object cipher — 25 tests |
 | `internal/scan` | walk, exclusions, hashing, `Diff` — 38 tests |
 | `internal/plan` | `Group`, `Layout`, `Pack` — 34 tests |
-| `internal/archive` | `Write`, `Verify`, `Restore`, containers, both headers — 24 tests |
+| `internal/archive` | `Write`, `Verify`, `Restore`, containers, both headers, volume identity — 34 tests |
 | `cmd/kura` | `plan`, `write`, `verify`, `restore`, `volumes`, `history`, `at-gen` — 10 tests |
 | `nix/e2e/scenarios` | seven NixOS VMs: real cartridges, swaps, ENOSPC, power cuts — see [TESTING.md](TESTING.md) |
 
-148 tests. Exercised against a real 356-file tree across six volumes: written,
+157 tests. Exercised against a real 356-file tree across six volumes: written,
 verified, restored byte-identical, then a flipped byte inside a container caught
 and attributed to the one file it damaged, marked lost, and re-sourced by the
 next plan.
@@ -112,12 +112,19 @@ next plan.
 
 ```sh
 kura plan   -root /storage -catalog catalog.jsonl.gz -out plan.json
-kura write  -plan plan.json -catalog catalog.jsonl.gz -drive /mnt/lto   # repeat per cartridge
-kura verify -catalog catalog.jsonl.gz -drive /mnt/lto
+kura write  -plan plan.json -catalog catalog.jsonl.gz -mount /mnt/lto   # repeat per cartridge
+kura verify -catalog catalog.jsonl.gz -mount /mnt/lto
 ```
 
-The `-drive` directory's base name is the volume ID, so loading the wrong
-cartridge is refused rather than guessed at.
+`-mount` is where the medium is mounted and nothing more — a drive is one fixed
+path, and the cartridge in it is whichever one the operator pushed in. Which
+volume that is comes from the medium's own `kura.volume.json`, so loading the
+wrong cartridge is refused rather than guessed at; a blank cartridge has no
+identity yet and becomes the volume the plan names.
+
+It names the mount point and never the device: kura does not mount block
+devices, because from a device alone it cannot know the filesystem. `-device`
+is the planned companion, for LTFS only, and it is not built. DESIGN §10.1.
 
 **Where each decision lives.** This split was got wrong once and is worth
 keeping straight:
@@ -201,6 +208,14 @@ containers/gNNNN/<item>.partNNN.tar   everything below the threshold
 - **Object names are untrusted input.** They arrive from a catalog that may have
   been read off a volume someone else wrote. `filevol.resolve` refuses anything
   escaping the volume; any new backend needs the same.
+- **A volume's identity comes off the medium, never from the drive.**
+  `kura.volume.json` is the only thing that knows which cartridge is loaded, and
+  `volume.Volume` has no `ID()` for that reason: a drive is one fixed mount
+  point and holds whatever was pushed in. This was got wrong once — the file
+  backend answered with its directory's base name, so the wrong-cartridge check
+  compared the medium's header against a path the operator had chosen, and
+  agreed with itself. `Reconcile` takes the expected volume from the plan; a
+  blank cartridge becomes it, a written one is checked against it. DESIGN §3.1.
 - **Never rely on mtime alone.** See DESIGN §6. Ctime is nanoseconds, mtime is
   seconds, and that asymmetry is deliberate.
 - **We correct no errors.** Every layer below either corrects silently or
@@ -222,6 +237,9 @@ if one turns out wrong, follow the link to what has to move with it.
 | Tape damage is a contiguous band across the medium | Whether parity must be striped across the tape or may sit in one region | Confirm the failure geometry before implementing parity at all |
 | Read throughput degrades measurably on marginal media | Channel 3 of the degradation signals (DESIGN §8.1) | Needs a baseline first: collect MB/s per volume per scrub from the very first scrub, since a trend started late is worthless |
 | LTO-6 usable capacity ≈ 2.5 TB | Planning arithmetic | Do not assume — LTFS reserves for the index partition. Read free space from the mounted filesystem, which also picks up compression gain |
+| `/proc/self/mountinfo` reports LTFS as `fuse.ltfs` | How the LTFS backend is recognised without a `--backend` flag, and therefore which `Sync` runs (DESIGN §10.1) | `findmnt -o SOURCE,FSTYPE,MAJ:MIN /mnt/lto` against a mounted cartridge — one command, and it also says whether the source string happens to carry the device |
+| LTFS flushes its index on demand, via the `ltfs.sync` virtual EA | `Volume.Sync` on tape. Without it the index only lands at unmount, so durability would require owning the mount | Set the EA on a mounted cartridge and check the index generation moved. `syscall.Setxattr` is in the standard library, so the mechanism costs no dependency |
+| `/sys/class/scsi_tape/*/device` and `/sys/class/scsi_generic/*/device` resolve to the same SCSI address | Finding the drive's sg node without asking the operator, which is what keeps `-device` an override rather than a required flag | Compare the two symlinks on the host. The `scsi_generic` half is confirmed; the tape half needs a drive attached |
 
 ## Working style
 

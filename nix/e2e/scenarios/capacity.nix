@@ -49,8 +49,8 @@
 
     with subtest("writing it to a cartridge that cannot hold it fails against the device"):
         blank(machine, 1)
-        mount = load(machine, 1, p["volumes"][0]["id"])
-        status, out = kura_status(machine, "write", "-plan", PLAN, "-catalog", CATALOG, "-drive", mount, "-quiet")
+        mount = load(machine, 1)
+        status, out = kura_status(machine, "write", "-plan", PLAN, "-catalog", CATALOG, "-mount", mount, "-quiet")
         unload(machine)
 
         assert status != 0, f"a write past the end of the medium reported success:\n{out}"
@@ -76,19 +76,19 @@
         for i, vid in enumerate(volumes):
             slot = i + 2  # the 64MB cartridge in slot 1 is not usable here
             blank(machine, slot)
-            write_volume(machine, slot, vid)
+            write_volume(machine, slot)
 
         for i, vid in enumerate(volumes):
-            assert_contains(verify_volume(machine, i + 2, vid), "Clean.", f"verify of {vid}")
+            assert_contains(verify_volume(machine, i + 2), "Clean.", f"verify of {vid}")
 
         for i, vid in enumerate(volumes):
-            restore_volume(machine, i + 2, vid, "/tmp/restored")
+            restore_volume(machine, i + 2, "/tmp/restored")
         assert_trees_identical(machine, STORAGE, restored_path("/tmp/restored"))
 
     with subtest("each written volume kept room to spare, index included"):
         for i, vid in enumerate(volumes):
-            mount = load(machine, i + 2, vid)
-            free = free_bytes(machine, vid)
+            mount = load(machine, i + 2)
+            free = free_bytes(machine)
             catalogs = int(machine.succeed(
                 f"ls -1 {mount}/generations/g0001/catalog.*.jsonl.gz | wc -l"
             ).strip())

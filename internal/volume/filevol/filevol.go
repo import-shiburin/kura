@@ -89,7 +89,6 @@ func (b *Backend) Open(ctx context.Context) (volume.Volume, error) {
 	v := &Volume{
 		backend: b,
 		dir:     b.dir,
-		id:      filepath.Base(b.dir),
 		used:    used,
 	}
 	if err := os.MkdirAll(filepath.Join(v.dir, tmpDir), 0o755); err != nil {
@@ -116,16 +115,16 @@ func (b *Backend) Health(ctx context.Context) (volume.Health, error) {
 }
 
 // Volume is a directory holding one volume's objects.
+//
+// It has no identity of its own, deliberately: the directory is a location, the
+// way a drive is, and which volume is in it is settled by reading the header
+// the medium carries. See the note on volume.Volume.
 type Volume struct {
 	backend *Backend
 	dir     string
-	id      string
 	used    int64
 	closed  bool
 }
-
-// ID is the volume's identifier, taken from its directory name.
-func (v *Volume) ID() string { return v.id }
 
 // Capacity reports total and remaining bytes.
 func (v *Volume) Capacity() (total, free int64, err error) {
@@ -163,7 +162,7 @@ func (v *Volume) Put(ctx context.Context, name string, size int64, r io.Reader) 
 		return err
 	}
 	if _, err := os.Lstat(dst); err == nil {
-		return fmt.Errorf("filevol: %q already exists on %s", name, v.id)
+		return fmt.Errorf("filevol: %q already exists on the volume at %s", name, v.dir)
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}

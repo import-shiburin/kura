@@ -63,10 +63,18 @@ type Backend interface {
 // Objects are named, and names may contain slashes: an implementation is free
 // to lay them out as a directory tree or to flatten them, but must return from
 // List exactly the names it was given to Put.
+//
+// There is deliberately no ID method. A volume's identity is written on the
+// volume, in kura.volume.json, and archive.VolumeIDOn is what reads it. A
+// backend cannot answer the question: a drive is a fixed mount point and the
+// cartridge in it is whichever one the operator pushed in, so anything the
+// backend could offer — a directory name, a device path — describes the drive
+// rather than the medium. This was got wrong once. The file backend returned
+// its directory's base name, which made the wrong-cartridge check compare the
+// medium's header against a string chosen by whoever ran mount: it passed only
+// when the operator had already named the mount point after the cartridge they
+// believed was loaded, so it confirmed that belief instead of testing it.
 type Volume interface {
-	// ID is the volume's own identifier, as recorded in the catalog.
-	ID() string
-
 	// Capacity reports the total and remaining bytes. Free is what Put can
 	// still accept, so an implementation that reserves space for an index
 	// subtracts that here rather than surprising the caller later.

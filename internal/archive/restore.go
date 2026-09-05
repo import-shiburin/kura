@@ -57,17 +57,20 @@ const PartialSuffix = ".kura-partial"
 // complete — a missing object is named, counted, and turns the exit non-zero
 // (DESIGN §8.1d).
 func Restore(ctx context.Context, vol volume.Volume, cat *catalog.Catalog, gen int, dest string, verify bool) (*RestoreResult, error) {
-	if _, err := ReadHeader(ctx, vol); err != nil {
+	// As in Verify: the loaded cartridge says which volume it is, and a restore
+	// produces whatever that volume owes rather than being told in advance.
+	h, err := ReadHeader(ctx, vol)
+	if err != nil {
 		return nil, err
 	}
-	res := &RestoreResult{Volume: vol.ID(), Elsewhere: make(map[string]int)}
+	res := &RestoreResult{Volume: h.Volume, Elsewhere: make(map[string]int)}
 
 	var here []*catalog.Record
 	for _, rec := range cat.At(gen) {
 		switch {
 		case rec.IsLost():
 			res.Lost = append(res.Lost, rec.Path)
-		case rec.UsesVolume(vol.ID()):
+		case rec.UsesVolume(res.Volume):
 			here = append(here, rec)
 		default:
 			for _, v := range rec.Volumes() {
@@ -198,7 +201,7 @@ func (r *RestoreResult) restoreParts(ctx context.Context, vol volume.Volume, rec
 
 	var got int64
 	for _, p := range rec.Parts {
-		if p.Volume != vol.ID() {
+		if p.Volume != r.Volume {
 			r.Elsewhere[p.Volume]++
 			continue
 		}

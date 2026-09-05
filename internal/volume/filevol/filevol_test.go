@@ -77,13 +77,6 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
-func TestVolumeID(t *testing.T) {
-	_, v := mount(t, 0)
-	if v.ID() != "LTO001" {
-		t.Errorf("ID = %q, want LTO001", v.ID())
-	}
-}
-
 // TestVolumeFull is one of the two reasons this backend exists: reaching the
 // swap path in a test without writing terabytes.
 func TestVolumeFull(t *testing.T) {
@@ -234,6 +227,13 @@ func TestEmptyDriveAndSwap(t *testing.T) {
 	ctx := context.Background()
 	b := New(1 << 20)
 
+	// The backend names itself, and that is the only name it has: since a
+	// volume's identity comes off the medium, "file" in an error message is
+	// what says which kind of drive produced it.
+	if b.Name() != "file" {
+		t.Errorf("Name = %q, want file", b.Name())
+	}
+
 	if _, err := b.Open(ctx); !errors.Is(err, volume.ErrNoVolume) {
 		t.Fatalf("empty drive should report ErrNoVolume, got %v", err)
 	}
@@ -251,9 +251,9 @@ func TestEmptyDriveAndSwap(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Open(%s): %v", id, err)
 		}
-		if v.ID() != id {
-			t.Errorf("ID = %q, want %q", v.ID(), id)
-		}
+		// The marker stands in for identity, which the backend deliberately
+		// does not carry: what distinguishes one loaded volume from another is
+		// its contents, not the path it was mounted at.
 		put(t, v, "marker", id)
 		if err := b.Release(ctx); err != nil {
 			t.Fatalf("Release(%s): %v", id, err)

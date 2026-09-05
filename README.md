@@ -68,16 +68,16 @@ kura plan -root /storage -exclude-from media.exclude \
           -catalog catalog.jsonl.gz -out plan.json
 
 # Write one volume, then exit. Run it again with the next cartridge loaded.
-kura write -plan plan.json -catalog catalog.jsonl.gz -drive /mnt/lto
+kura write -plan plan.json -catalog catalog.jsonl.gz -mount /mnt/lto
 
 # Read a volume back and check it against the digests written with it.
-kura verify -catalog catalog.jsonl.gz -drive /mnt/lto
+kura verify -catalog catalog.jsonl.gz -mount /mnt/lto
 
 # Which cartridge is most overdue a check?
 kura volumes -catalog catalog.jsonl.gz
 
 # Put a past state back. One volume at a time; it says what is still to mount.
-kura restore -catalog catalog.jsonl.gz -drive /mnt/lto -into /restore -at-gen 7
+kura restore -catalog catalog.jsonl.gz -mount /mnt/lto -into /restore -at-gen 7
 
 # What was the archive at generation 7, and can all of it still be read?
 kura at-gen -catalog catalog.jsonl.gz 7    # exits non-zero if anything is lost
@@ -88,6 +88,12 @@ Every command handles one volume and exits, with state in the catalog, so the
 drive can sit powered off for weeks between cartridges. That is the whole reason
 this exists: the `tar -M` scripts it replaces held one process open across every
 swap.
+
+`-mount` is just where the medium is mounted — the same path every time. It is a
+mount point and not a device: mount the medium yourself and point kura at it.
+Which cartridge is in it is read from the volume itself, so loading the wrong one
+is refused instead of silently written over, and a blank one becomes whatever
+volume the plan asked for.
 
 Scanning a ZFS snapshot works with `-root /storage/.zfs/snapshot/x=/storage`,
 which records the files under the live path so their identity survives the
