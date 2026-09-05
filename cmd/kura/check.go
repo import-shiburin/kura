@@ -1,0 +1,295 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"os"
+	"sort"
+	"text/tabwriter"
+	"time"
+
+	"kura/internal/archive"
+	"kura/internal/catalog"
+	"kura/internal/plan"
+)
+
+func runVerify(argv []string) {
+	fs := flag.NewFlagSet("verify", flag.ExitOnError)
+	var (
+		catalogPath = fs.String("catalog", "", "catalog to check against and update (required)")
+		drive       = fs.String("drive", "", "directory standing in for the loaded volume (required)")
+		noMark      = fs.Bool("no-mark", false, "report failures without recording them in the catalog")
+	)
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, `kura verify - read one volume back and check it against its digests
+
+  kura verify -catalog catalog.jsonl.gz -drive /mnt/lto/LTO001
+
+Reads every object the catalog says this volume holds and compares it against
+the digest recorded when it was written. Nothing below this tool reports a
+correction, so a read either works or it does not: this detects and reports,
+and never repairs.
+
+Failures are marked in the catalog, which is what makes the next plan re-source
+those files from the live tree automatically. Exits non-zero if anything failed.
+
+Flags:
+`)
+		fs.PrintDefaults()
+	}
+	fs.Parse(argv)
+
+	if *catalogPath == "" || *drive == "" {
+		fmt.Fprintln(os.Stderr, "error: -catalog and -drive are both required")
+		fs.Usage()
+		os.Exit(2)
+	}
+
+	cat, err := catalog.Load(*catalogPath)
+	if err != nil {
+		fatal(err)
+	}
+	ctx := context.Background()
+	backend, vol, err := openDrive(ctx, *drive, 0)
+	if err != nil {
+		fatal(err)
+	}
+	defer backend.Release(ctx)
+
+	fmt.Fprintf(os.Stderr, "verifying %s ...\n", vol.ID())
+	res, err := archive.Verify(ctx, vol, cat, !*noMark)
+	if err != nil {
+		fatal(err)
+	}
+
+	if !*noMark {
+		if err := catalog.Write(*catalogPath, cat.Header, cat.Records); err != nil {
+			fatal(err)
+		}
+	}
+
+	fmt.Printf("\n=== VERIFY %s ===\n", res.Volume)
+	fmt.Printf("  %s checked, %s\n", count(int64(res.Checked), "object"), plan.FormatBytes(res.Bytes))
+	if res.Elapsed > 0 && res.Bytes > 0 {
+		// Worth recording every time: a drive re-reading marginal media
+		// delivers data more slowly, and that trend is the earliest free
+		// warning there is. It only means something as a series.
+		fmt.Printf("  %s at %s/s — record this; the trend is the signal, not the value\n",
+			res.Elapsed.Round(time.Millisecond),
+			plan.FormatBytes(int64(float64(res.Bytes)/max(res.Elapsed.Seconds(), 0.001))))
+	}
+	if len(res.Unclaimed) > 0 {
+		fmt.Printf("\n  %s on the volume that no record accounts for:\n", count(int64(len(res.Unclaimed)), "object"))
+		for _, n := range res.Unclaimed {
+			fmt.Printf("    %s\n", n)
+		}
+		fmt.Printf("  Left alone. On media that never reclaims space this means the catalog\n")
+		fmt.Printf("  lost track of a write, which is worth looking at rather than tidying away.\n")
+	}
+	if !res.Failed() {
+		fmt.Printf("\n  Clean.\n")
+		return
+	}
+
+	fmt.Printf("\n  %s FAILED to read back as recorded:\n", count(int64(len(res.Findings)), "object"))
+	for _, f := range res.Findings {
+		fmt.Printf("    %s\n      via %s: %v\n", f.Path, f.Object, f.Err)
+	}
+	if !*noMark {
+		fmt.Printf("\n  Marked lost in the catalog. The next plan will re-source them from the\n")
+		fmt.Printf("  live tree for anything still there; run kura at-gen to see what history\n")
+		fmt.Printf("  this costs. Try another drive first — head alignment varies, and a volume\n")
+		fmt.Printf("  unreadable on the drive that wrote it may read on a different one.\n")
+	}
+	os.Exit(1)
+}
+
+func runRestore(argv []string) {
+	fs := flag.NewFlagSet("restore", flag.ExitOnError)
+	var (
+		catalogPath = fs.String("catalog", "", "catalog to restore from (required)")
+		drive       = fs.String("drive", "", "directory standing in for the loaded volume (required)")
+		into        = fs.String("into", "", "directory to restore into (required)")
+		atGen       = fs.Int("at-gen", 0, "generation to reconstruct; default is the newest")
+		noVerify    = fs.Bool("no-verify", false, "skip digest checking as files are written")
+	)
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, `kura restore - write out what one volume holds
+
+  kura restore -catalog catalog.jsonl.gz -drive /mnt/lto/LTO001 -into /restore
+
+Restores the part of a generation that lives on the loaded volume, then says
+what is still outstanding and on which volumes. Run it again with each of those
+loaded. It never quietly produces a directory that looks complete: anything it
+cannot produce is named, and the exit is non-zero.
+
+Flags:
+`)
+		fs.PrintDefaults()
+	}
+	fs.Parse(argv)
+
+	if *catalogPath == "" || *drive == "" || *into == "" {
+		fmt.Fprintln(os.Stderr, "error: -catalog, -drive and -into are all required")
+		fs.Usage()
+		os.Exit(2)
+	}
+
+	cat, err := catalog.Load(*catalogPath)
+	if err != nil {
+		fatal(err)
+	}
+	gen := *atGen
+	if gen == 0 {
+		gen = cat.MaxGen()
+	}
+	if gen < 1 {
+		fatal(fmt.Errorf("the catalog is empty; there is nothing to restore"))
+	}
+
+	ctx := context.Background()
+	backend, vol, err := openDrive(ctx, *drive, 0)
+	if err != nil {
+		fatal(err)
+	}
+	defer backend.Release(ctx)
+
+	fmt.Fprintf(os.Stderr, "restoring generation %d from %s into %s ...\n", gen, vol.ID(), *into)
+	res, err := archive.Restore(ctx, vol, cat, gen, *into, !*noVerify)
+	if err != nil {
+		fatal(err)
+	}
+
+	fmt.Printf("\n=== RESTORE %s, generation %d ===\n", res.Volume, gen)
+	fmt.Printf("  %s produced, %s\n", count(int64(res.Restored), "file"), plan.FormatBytes(res.Bytes))
+
+	if len(res.Elsewhere) > 0 {
+		ids := make([]string, 0, len(res.Elsewhere))
+		for id := range res.Elsewhere {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		fmt.Printf("\n  Still to mount:\n")
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		for _, id := range ids {
+			fmt.Fprintf(w, "    %s\t%s\n", id, count(int64(res.Elsewhere[id]), "file"))
+		}
+		w.Flush()
+	}
+	if len(res.Incomplete) > 0 {
+		fmt.Printf("\n  %s span volumes and are only partly written; they keep a %s\n",
+			count(int64(len(res.Incomplete)), "file"), archive.PartialSuffix)
+		fmt.Printf("  suffix until the volumes holding the rest have been restored:\n")
+		for _, p := range res.Incomplete {
+			fmt.Printf("    %s\n", p)
+		}
+	}
+	if len(res.Lost) > 0 {
+		fmt.Printf("\n  %s CANNOT be produced: the catalog already records them as lost.\n",
+			count(int64(len(res.Lost)), "file"))
+		for _, p := range res.Lost {
+			fmt.Printf("    %s\n", p)
+		}
+	}
+	if len(res.Failed) > 0 {
+		fmt.Printf("\n  %s FAILED:\n", count(int64(len(res.Failed)), "file"))
+		for _, f := range res.Failed {
+			fmt.Printf("    %s\n      via %s: %v\n", f.Path, f.Object, f.Err)
+		}
+	}
+	if !res.OK() {
+		fmt.Printf("\n  This restore is incomplete. Nothing above was silently skipped.\n")
+		os.Exit(1)
+	}
+	if len(res.Elsewhere) == 0 && len(res.Incomplete) == 0 {
+		fmt.Printf("\n  Generation %d is complete in %s.\n", gen, *into)
+	}
+}
+
+func runVolumes(argv []string) {
+	fs := flag.NewFlagSet("volumes", flag.ExitOnError)
+	var (
+		catalogPath = fs.String("catalog", "", "catalog to read")
+		overdue     = fs.String("overdue", "180d", "flag volumes not verified within this long; accepts 30d, 12h")
+	)
+	fs.Parse(argv)
+
+	cat, err := catalog.Load(*catalogPath)
+	if err != nil {
+		fatal(err)
+	}
+	window, err := parseDuration(*overdue)
+	if err != nil {
+		fatal(fmt.Errorf("-overdue: %w", err))
+	}
+
+	if len(cat.Header.Volumes) == 0 {
+		fmt.Println("no volumes recorded yet")
+		return
+	}
+	inventory := append([]catalog.VolumeInfo(nil), cat.Header.Volumes...)
+	sort.Slice(inventory, func(i, j int) bool { return inventory[i].ID < inventory[j].ID })
+
+	fmt.Printf("\n=== VOLUMES (archive %s) ===\n", cat.Header.Archive)
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(w, "  VOLUME\tOBJECTS\tSIZE\tWRITTEN\tLAST VERIFIED\tLOST\n")
+	var due []string
+	for _, v := range inventory {
+		lost := 0
+		for _, r := range cat.OnVolume(v.ID) {
+			if r.IsLost() {
+				lost++
+			}
+		}
+		verified := v.LastVerified
+		if verified == "" {
+			verified = "never"
+			due = append(due, v.ID)
+		} else if t, err := time.Parse(time.RFC3339, verified); err == nil && time.Since(t) > window {
+			verified += "  (overdue)"
+			due = append(due, v.ID)
+		}
+		lostCol := ""
+		if lost > 0 {
+			lostCol = fmt.Sprint(lost)
+		}
+		fmt.Fprintf(w, "  %s\t%d\t%s\t%s\t%s\t%s\n",
+			v.ID, v.Objects, plan.FormatBytes(v.Bytes), orDash(v.Written), verified, lostCol)
+	}
+	w.Flush()
+
+	if len(due) > 0 {
+		// A full scrub cannot be one command that runs for days, so the useful
+		// question is which volume to put in the drive next (DESIGN §8).
+		fmt.Printf("\n  Most overdue first: %v\n", due)
+		fmt.Printf("  kura verify -catalog ... -drive <the one holding %s>\n", due[0])
+	}
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// parseDuration accepts Go durations plus a day suffix, because verification
+// intervals are naturally months rather than hours.
+func parseDuration(s string) (time.Duration, error) {
+	if days, ok := cutSuffix(s, "d"); ok {
+		d, err := time.ParseDuration(days + "h")
+		if err != nil {
+			return 0, err
+		}
+		return d * 24, nil
+	}
+	return time.ParseDuration(s)
+}
+
+func cutSuffix(s, suffix string) (string, bool) {
+	if len(s) > len(suffix) && s[len(s)-len(suffix):] == suffix {
+		return s[:len(s)-len(suffix)], true
+	}
+	return s, false
+}

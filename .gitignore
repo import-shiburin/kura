@@ -1,0 +1,15 @@
+# Build output
+/kura
+/kura-*
+*.exe
+
+# Local working state — a real archive's catalog and staging never belong in git
+*.jsonl
+*.jsonl.gz
+plan.json
+/lists/
+/stage/
+
+# Editor and OS debris
+.DS_Store
+*.swp

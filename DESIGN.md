@@ -1,0 +1,653 @@
+# Design
+
+Decisions that are hard or impossible to change once bytes are on media, and the
+reasoning behind each. Where a decision reversed during design, the reversal is
+recorded — the wrong turn is usually more informative than the destination.
+
+A presentation version of this lives at
+<https://claude.ai/code/artifact/fcb71331-037f-4f28-907e-0a1f0b20d0b1>. This file
+is the source of truth.
+
+---
+
+## 1. The core is not about tape
+
+Strip the vocabulary away and the model is: **fixed-capacity, append-only,
+offline volumes, mounted by hand, weeks between handling, no reclamation.**
+Nothing in that says tape.
+
+Everything above the `volume` package — planning, packing, the catalog,
+generations, tombstones, encryption, verification scheduling — is medium-
+agnostic and stays that way. A backend supplies six things: capacity, mount,
+write, read, unmount, health.
+
+| | LTO / LTFS | BD-R · M-DISC | Rotating disk |
+|---|---|---|---|
+| Volume size | 2.5–18 TB | 25–128 GB | 1–20 TB |
+| Filesystem | LTFS | UDF | ext4 · exFAT · ZFS |
+| Reclaim possible | no | no — write-once | yes, but the model declines to |
+| Health source | MAM · TapeAlert | disc quality scan, if exposed | SMART |
+| Cleaning concept | yes | none | none |
+| Index check | `ltfsck` | none | `fsck` · `scrub` |
+
+**Not generalized to online targets.** See README.
+
+### 1.1 Two backends from day one
+
+The file backend is not a second product, it is the **test harness**. A bug here
+destroys data, and a tape drive cannot be meaningfully tested against — not in
+CI, not on a laptop, and not at the failure paths that matter:
+
+- flip a byte and confirm verify catches it
+- declare a 40 MB volume and exercise the swap path
+- kill a writer mid-object and confirm the next run reconciles
+- construct a divergent catalog deliberately
+- generate a random tree, mutate it across generations, restore at generation
+  *N*, assert it matches what the tree was at *N* — thousands of cheap cycles
+
+None of that is arrangeable against a cartridge on demand. So the file backend
+is built first and the LTFS backend conforms to an interface that already works.
+
+---
+
+## 2. Two modes: plain and encrypted
+
+**Plain is the default.** Mount the volume, browse, `cp` files out. Nothing
+proprietary is needed to read it, ever. This is the property the whole thing was
+built around and it does not get taken away by accident.
+
+**Encrypted** means contents encrypted, names replaced by random IDs, structure
+flattened, catalog encrypted.
+
+An earlier draft had a middle rung — encrypted contents, legible names — on the
+theory an operator might want to see what a volume holds without unlocking it.
+It did not survive contact with the alternative: once scrambling costs 23 MB
+across the whole archive (§4), leaving names in the clear protects nobody and
+only creates a footgun. Two modes is also a much smaller test matrix.
+
+### 2.1 Residual leak — do not oversell
+
+Scrambling hides names. It does **not** hide object sizes or object count, both
+of which sit in the filesystem index in the clear. An exact byte count
+fingerprints a known release precisely, so an adversary with a candidate list
+can still confirm what an archive contains. Closing that needs size padding,
+which on write-once media costs capacity forever. Document the limit; offer
+padding later as an explicit, expensive option if anyone asks.
+
+---
+
+## 3. Software encryption only
+
+LTO-6 drives implement AES-256-GCM in hardware — keys over SCSI `SPOUT`, status
+over `SPIN`, under 1% throughput cost, and the key never touches the cartridge.
+Good technology, wrong choice here, for a reason unrelated to its quality:
+**it exists on exactly one of the media this tool targets.** Building the
+security model on a capability that vanishes when someone points the tool at a
+hard disk means either two encryption paths to test, or a mode that silently
+offers less protection than the user asked for.
+
+LTFS's own encryption support argues the same way from the other side: marked
+experimental, only `simple` and `flatfile` key plugins, and volumes written that
+way cannot be imported into key-server-managed libraries.
+
+Drive encryption remains available to anyone who wants it as an independent
+layer underneath. The tool need not know.
+
+### 3.1 The volume header
+
+Exactly one object per volume stays plaintext — enough for the tool to recognise
+its own work and know how to proceed, and nothing more.
+
+```json
+{
+  "magic":      "kura-volume",
+  "format":     1,
+  "archive":    "8f14e45f-…",
+  "volume":     "c9f0f895-…",
+  "encrypted":  true,
+  "cipher":     "aes-256-gcm",
+  "kdf":        "argon2id",
+  "kdf_params": { "salt": "…", "m": 262144, "t": 3, "p": 4 },
+  "generation": 3,
+  "written":    "2026-09-02T11:04:00Z"
+}
+```
+
+The salt must be plaintext — a passphrase cannot become a key without it. The
+cipher and KDF identifiers are what let the format outlive its own algorithms:
+**reading dispatches on what the header declares, writing always uses the
+current default.** That matters more here than in most formats, because this
+medium cannot be re-encrypted in place.
+
+`generation` and `written` are the one judgement call. Strictly they leak an
+activity timeline. Without them, twenty encrypted cartridges are twenty
+identical bricks and you cannot tell which is newest without unlocking each —
+which was the entire reason for a header.
+
+### 3.2 Random IDs, not a keyed hash
+
+An HMAC of the path is tempting: deterministic, so a known file could be located
+with only the key if the catalog were damaged. It leaks equality though — the
+same object name recurring across volumes and generations tells an observer a
+file did not change, which over a long-lived archive is a real traffic-analysis
+surface. The recoverability it buys is close to nil, since the catalog is
+mandatory in both modes and rides on every volume.
+
+Random IDs, and flatten the directory structure too: scrambled names arranged in
+the original tree still expose its shape.
+
+### 3.3 Keys cannot be rotated
+
+**A key cannot be rotated for data already on media.** Rotation works by
+re-encrypting, and this archive never rewrites — which is the same property that
+buys point-in-time restore. Rotation applies only to future generations, and a
+compromised key stays valid for every volume already written.
+
+The corollary: the passphrase is a single point of total loss, worse than in a
+disk-backed tool because there is no second copy. `init` should push hard toward
+a printed recovery code and refuse to proceed silently without one.
+
+---
+
+## 4. Tarring is for speed; IDs are for privacy
+
+Small files are bundled into tar containers so the filesystem stops paying a
+per-file cost. That threshold is **1 MB**, and it is **unchanged by the
+encryption setting**.
+
+An earlier draft argued that because a tarball hides its members' names,
+encrypting should push the threshold up until everything was containerised. That
+was wrong — it reached for the expensive instrument. Measured against the real
+archive (1,443,034 files under 1 MB, 135.02 GB):
+
+| Hiding 1.44 M filenames via… | Overhead | Of tarred data |
+|---|---|---|
+| tar, real paths | 2.11 GB | 1.6% |
+| tar, ID-named members | 1.11 GB | 0.8% |
+| manifest: random ID per file | **23 MB** | 0.017% |
+
+~90× cheaper, because 78% of these paths exceed tar's 100-byte name field and
+need a GNU long-name entry, while the path is already stored in the catalog and
+the ID is the only new field.
+
+So the two mechanisms separate cleanly:
+
+- **Tar buys write speed** — 1.65 M objects collapse to 210 k. Costs 2.11 GB,
+  which is 1.6% of the tarred data but **0.007% of the 31 TB archive**.
+- **Random IDs buy privacy** — 23 MB, applied to every object.
+
+They compose without interfering, and the encrypted and plain layouts stay
+structurally identical, which is worth a great deal when the test suite covers
+both. One optimisation: when encrypting, tar members can be named by their IDs
+rather than paths, halving container overhead to 1.11 GB.
+
+### 4.1 Grouping rule
+
+A subtree that fits within the cap becomes one tarball. When it does not,
+**merge consecutive siblings into runs of ≤ cap in name order**, recursing only
+into children that individually exceed the cap.
+
+The sibling merge is not optional. Without it, descending into fanout
+directories (immich's hash tree) emits one tarball per child: a first attempt
+produced 107,051 tarballs, 99,492 of them under 10 MB. With it, 4,298.
+
+When a single directory's own files exceed the cap they chunk in name order.
+Membership is fixed at write time and never revisited, so boundaries never shift
+retroactively — new files go into new tarballs in a later generation. Names carry
+the generation (`<dir>.g0003.part001.tar`) so a later chunking of the same
+directory cannot collide.
+
+---
+
+## 5. The catalog is a history, not a snapshot
+
+Space is never reclaimed, so the bytes for every past state stay on the media
+whether or not anything remembers them. **Only the bookkeeping is optional**,
+and it costs one line per change. So records are never removed, only tombstoned:
+
+- `gen` — the generation that wrote this version
+- `deleted_gen` — the generation in which the path stopped existing; zero means
+  it is still there
+
+A path may have several versions. Whether it **exists** is a property of its
+newest version, not of any single record — an older version keeps `deleted_gen`
+zero because its bytes are still the correct answer for any generation before
+the edit.
+
+That distinction is load-bearing. A file written, later rewritten, then deleted
+leaves an untombstoned first version behind; reading liveness off individual
+records would resurrect the path. This was a real bug in the planner, caught by
+`TestDeletionAfterRewriteStaysDeleted`.
+
+Deletion detection must also run over live paths only, or a file removed three
+cycles ago is reported as newly deleted forever.
+
+### 5.1 Unavailability is per version, not per path
+
+When a volume is damaged the catalog starts lying: it says a path at generation
+*N* lives at object *X* on volume *V*, and those bytes are gone. It has to be
+able to say so, and at the right granularity.
+
+That granularity is **the version, not the path**. A file written at generation
+1 and rewritten at generation 5 has two records on two volumes; if only the
+older volume is damaged, the file is unavailable for generations 1–4 and fine
+from 5 onward. Marking the record rather than the path gives that for free,
+because a record already covers a generation range.
+
+```go
+// Lost records that a version's bytes are no longer retrievable.
+type Lost struct {
+    Gen    int    // when this was recorded
+    Reason string // "media" | "reclaimed"
+    Detail string // "LTO007 unreadable during verify 2026-09-03"
+}
+```
+
+**A lost record is never removed.** It still carries the size, the digest, the
+generations it covered and the volume it was on — which is what lets `at-gen`
+report *"1,247 objects unavailable"* instead of quietly returning a short tree,
+and what lets the content be recognised if it ever turns up again.
+
+The two reasons differ in a way that matters to whoever reads the report:
+`reclaimed` was chosen, `media` was suffered. Never collapse them into one flag.
+They also differ in reversibility — a reclaimed volume has been erased, whereas
+a `media` marker is a *current assessment* and can be cleared if the object
+later reads successfully. That is the payoff of the retry ladder in §8.1: a
+different drive succeeds, the marker comes off.
+
+Four consequences for the queries, and the first is the useful one:
+
+1. **Diff treats a lost version as needing a write**, even when stat data
+   matches. So marking something lost automatically re-protects it on the next
+   cycle, for anything still on the source — self-healing that falls out of the
+   existing incremental logic rather than needing its own machinery. It is what
+   borg achieves by accident when a later backup happens to re-supply a chunk,
+   except deliberate and scoped.
+2. `At(gen)` returns lost records flagged rather than omitting them, so a
+   point-in-time query can be honest about its holes.
+3. `Lookup` still returns the version; callers check `Lost` themselves. The path
+   does exist — it just cannot currently be produced.
+4. **Restore fails loudly, per object, and exits non-zero.** Never a directory
+   that looks complete.
+
+Markers are set by `verify` when a read fails, by `reclaim` for history
+deliberately not carried forward, and left in place by `repair` for whatever it
+could not re-source.
+
+---
+
+## 6. Change detection
+
+| tool | "unchanged" test | content identity |
+|---|---|---|
+| rclone | size + mtime | whole-file backend hash |
+| restic | path + mtime + **ctime** + size + **inode** | SHA-256 per CDC chunk |
+| borg | size + mtime_ns + **inode** | SHA-256 per chunk |
+| rmlint / jdupes | size → partial hash → full hash → byte-for-byte | full verify before declaring a match |
+| **kura** | size + mtime + **ctime** + **inode** | sampled digest, confirmed by full digest |
+
+**Ctime and inode corroborate mtime.** Userspace can set mtime freely and plenty
+of software does — package managers, archive extraction, `rsync -t`, torrent
+clients, media managers. A file rewritten at the same size with its mtime put
+back is invisible to a size-and-mtime check, so it would never be backed up
+again and the loss surfaces at restore time. Restic has an open issue titled
+exactly that ([#2179](https://github.com/restic/restic/issues/2179)).
+
+Ctime is stored in **nanoseconds** while mtime is seconds, because the case it
+exists to catch is a rewrite within the same second as the previous scan —
+precisely where second granularity is blind. Storing it in seconds made both
+guard tests skip.
+
+**But a ctime mismatch triggers a read, not a rewrite.** This is where tape
+economics diverge from a disk-backed tool. Restic and borg treat ctime
+disagreement as "changed" and re-read, which costs almost nothing. Here a false
+"changed" verdict costs a *write to media*, so the file is hashed to decide: a
+`chmod -R` sweep must not rewrite the archive, and a file whose mtime was
+restored after a real edit must not be missed.
+
+`-ignore-ctime` and `-ignore-inode` relax it, named to match restic's flags.
+
+### 6.1 Matching
+
+Tiered size → sampled digest → full digest, the same shape rmlint and jdupes
+use. Default confirms against a whole-file digest, following jdupes' rule of
+never declaring a match on a partial hash alone — the sampled digest covers size
+plus the first and last mebibyte, so two files differing only in the middle
+collide, which for a move means restoring the wrong bytes under the right name.
+
+The match pool includes tombstoned records, so content deleted generations ago
+and re-added today costs a catalog line rather than a write.
+
+### 6.2 Content-defined chunking: rejected
+
+CDC (restic, borg) would dedupe *within* a modified file — editing 1 MB of a
+40 GB image would store 1 MB rather than 40 GB. Rejected because reassembling a
+file from chunks requires the tool, and the requirement here is that a volume be
+restorable with standard utilities. Media files also tend to be replaced
+wholesale rather than edited in place.
+
+---
+
+## 7. Snapshots
+
+A run spanning days cannot read a live tree — files move underneath it and the
+plan goes stale. Confirmed in practice: the first scan of `/storage` lost ~21
+files mid-run to Loki/Tempo WAL churn; a second, faster scan lost 1. Exposure
+scales with how long you are looking, and a write is measured in days.
+
+`--root PATH=CANONICAL` reads from a snapshot and records under the live path.
+Without it a ZFS snapshot's `.zfs/snapshot/<label>` prefix changes every cycle,
+every file looks new, and the incremental scheme collapses. Exclusion patterns
+match the canonical path, so one exclude file works whatever the snapshot is
+called.
+
+**On ZFS specifically:** ctime is fine (nanosecond timestamps in the znode).
+Inode is fine for this purpose — object IDs are stable within a dataset, are
+presented identically inside snapshots, and survive `zfs send`/`recv`. ZFS
+recycles object IDs (disambiguated by a generation number `stat()` does not
+expose) and each dataset has its own ID space, but neither produces a false
+"unchanged" here, only extra files marked suspect. `-ignore-inode` covers the
+noisy cycle after a pool rebuild.
+
+`zfs diff` was considered and **rejected**: it reports renames explicitly and
+would skip the tree walk, but a cold scan is ~35 min against a multi-day write —
+about 1% — which does not justify a ZFS-specific path plus `zfs allow` setup.
+
+---
+
+## 8. Verification
+
+| Tier | Cost | Catches |
+|---|---|---|
+| Cartridge memory | instant | drive-reported errors, load count, lifetime writes — from MAM, without touching media |
+| Index check | seconds | `ltfsck`: index consistency, unclean unmounts |
+| Full read + digest | ~4 h / volume | actual bit rot, against the digests the writer recorded |
+
+A full scrub reads every byte — ~31 TB, roughly the 54 hours the write took. It
+cannot be one command that runs for days; track `last_verified` per volume and
+rotate, so the tool answers "which is most overdue?" Surface the **trend** in
+soft error counts, not the current value: a volume degrading over three scrubs
+is the signal, and it arrives long before a read fails.
+
+TapeAlert flags are **cleared when the page is read**, so read once after every
+operation and persist them or they are lost.
+
+### 8.1 We correct nothing, and cannot
+
+This tool sits on a filesystem — LTFS for tape, ext4 or similar for disk — and
+every error correction that exists happens below it. The drive's Reed-Solomon
+runs continuously and silently; the disk reallocates sectors without telling
+anyone. **Those corrections are never propagated up.** A read either succeeds,
+in which case we cannot tell whether it took one attempt or four hundred, or it
+fails with EIO, by which point every layer beneath has already given up and the
+data is gone.
+
+So the tool's entire error story is *detect, report, migrate* — never repair.
+Worth stating plainly in the README, because "backup software" invites the
+opposite assumption.
+
+The one exception, and the only correction capability that could ever exist
+here, is **parity we add ourselves**, above the filesystem (see the table
+below). Everything else in this section is about noticing in time.
+
+#### Degradation is observable, but never through the filesystem
+
+Three channels, and only the first is precise:
+
+1. **Out-of-band device query.** SCSI `LOG SENSE` read/write error counters,
+   TapeAlert, and MAM for tape; SMART for a disk. These carry the corrected-
+   error counts the filesystem hides. They require the *device* alongside the
+   mount — so a backend needs both paths, plus raw device access and usually
+   elevated privileges. Until that is built, `Health` returns `StatusUnknown`
+   for every real backend and `StatusDegrading` never fires. *Unverified:*
+   whether the drive will answer LOG SENSE while LTFS holds it mounted; if not,
+   read the counters at mount and unmount instead.
+
+2. **Retry counts from our own verify pass.** Filesystem-level, free, needs no
+   privileges. A volume that needed three retries this scrub and none the last
+   is degrading, and we can see that without asking the device anything.
+
+3. **Read throughput per volume, tracked across scrubs.** The most useful free
+   signal, and the least obvious. A drive re-reading marginal media internally
+   delivers data more slowly — the corrections are invisible but *the time they
+   cost is not*. Same for a disk stalling on pending sectors. Recording
+   effective MB/s per volume per scrub turns invisible corrections into a
+   visible trend. Needs calibration against normal variance before it can raise
+   an alarm, but it costs nothing to collect from the first scrub onward, and
+   the history is worthless if collection starts later.
+
+Which makes the scrub schedule load-bearing rather than hygienic: channels 2 and
+3 only exist if verification runs regularly, and without any of the three there
+is no early warning at all.
+
+`StatusDegrading` is therefore a **migration trigger, not a repair signal**. A
+volume whose numbers are worsening is still fully readable *today*, and copying
+it to fresh media now is the whole remedy. Miss the window and the option is
+gone. This is the media-retirement path in §9.1.
+
+**Attribute, do not just count.** Errors across every cartridge mean a dirty or
+dying drive; errors on one mean that cartridge. Opposite responses.
+
+#### What can actually be done about a bad read
+
+| | Cost | Recovers | Corrects? |
+|---|---|---|---|
+| Retry, re-seat, clean, **try a different drive** | free | transient errors — tension, alignment, debris. Head alignment varies between drives, so a tape unreadable on the drive that wrote it may read on another | no — retries the read |
+| Intra-volume parity records (~5%) | 5% capacity | localized damage: a crease, a scratch, a bad patch. Not a lost cartridge | **yes** — the only real correction available |
+| Cross-volume erasure coding | ~8% for one parity volume in 13 | total loss of any one volume — but rebuilding means reading *all* survivors: ~50 hours and 12 manual swaps | yes |
+| **A second independent copy** | one more volume set | everything, in one mount | no — substitutes |
+
+Parity works despite the filesystem because a read error is per-block: EIO on
+one region does not stop us seeking past it and reading the rest, so the
+readable remainder plus parity reconstructs the hole. That makes intra-volume
+parity the only mechanism by which this tool could ever repair anything, which
+raises it from a nice-to-have to the one deliberate gap in the design.
+
+#### What the reference implementations actually do
+
+Checked, because "surely restic solves this" is the obvious first thought:
+
+- **restic** — `check --read-data` detects; `repair packs` and `repair snapshots`
+  remediate. No parity, no redundancy, no error correction anywhere in the
+  format. `repair snapshots` *removes* inaccessible data from snapshots: damage
+  mitigation, not recovery. Its advice is to rerun the backup, since a later run
+  may re-supply the missing blobs and heal older snapshots, and to go fix the
+  hardware.
+- **borg** — `check --repair` recovers what it can from segments with integrity
+  errors and rebuilds the index, then replaces lost chunks with **same-size
+  all-zero chunks**, with extract warning distinctly about them. A zero-patched
+  file can be healed later if the lost chunks reappear via a subsequent backup.
+  The documentation is blunt: *"Fixing corruptions does not mean recovering lost
+  data… Repairing a repository means sacrificing some data for the sake of the
+  repository as a whole."*
+- **dar** — the maintainer **declined** to build parity into the format
+  ([feature request #170][dar170], closed 2018), on the grounds that par2 already
+  does it well and adjustably and embedding it would complicate the tool. dar
+  does carry structural redundancy: duplicate slice and archive headers, and
+  **catalog copies distributed throughout the archive**, so it survives a
+  corrupted or missing slice at the metadata level.
+- **In practice**, dar users pair it with par2 externally — [dar-backup][] ships
+  **5% coverage** by default, "enough to fix localized bitrot."
+- **For tape specifically**, the standard answer remains two copies. There is no
+  established in-band redundancy scheme.
+
+[dar170]: https://sourceforge.net/p/dar/feature-requests/170/
+[dar-backup]: https://github.com/per2jensen/dar-backup
+
+So nobody in this space corrects data errors in-format, which is a reassuring
+confirmation rather than a gap to fill. Four things are worth taking from it:
+
+**a. Replicate the catalog within a volume, not just across volumes.** Stolen
+directly from dar. The catalog is already written to every volume, but once per
+volume — so damage to the region holding it costs that volume's index. It is
+small; write it two or three times at separated points on the medium. Nearly
+free, and it protects the one structure whose loss makes everything else on the
+volume unreadable.
+
+**b. `kura repair --volume X` — re-source from the live tree.** This is the
+mechanism restic and borg both fall back on ("rerun the backup and it may heal"),
+except we can aim it. The catalog knows exactly which objects a given volume
+holds, and the source is normally intact, so a damaged volume's contents can be
+re-sourced from disk and rewritten to current media without a full backup run
+and without reading the damaged volume at all. It is the reclamation machinery
+(§9.1) pointed at a different trigger, so most of it is already designed. This
+is the strongest recovery capability available here and it should be a named
+command rather than folklore.
+
+**c. Parity: opt-in, par2-style, ~5%.** Matches established practice and the
+failure mode it addresses. Worth weighing the dar maintainer's objection — that
+it complicates a tool for something an external utility already does well —
+though two of his specific reasons (no temporary files, streaming over SSH) are
+not constraints here, and on LTFS the recovery files are simply more objects on
+the volume.
+
+**d. Never silently produce a short tree.** Borrowed from borg's zero-chunk
+behaviour, which is loud by design. A restore that cannot produce an object must
+say so per object and exit non-zero — never quietly write a directory that looks
+complete. Same principle as the catalog being honest about its holes (§9.1).
+
+Recommended: build the **retry ladder** (it is free and recovers real transient
+failures, and a second drive is the single highest-value thing in the list);
+offer **intra-volume parity** as opt-in, since localized damage is the common
+case and it needs no cross-volume reads; and **do not build erasure coding**.
+Spending 50 hours and twelve swaps to rebuild one cartridge is worse than
+keeping a second copy, which the tool already supports — a second archive UUID
+over the same source, with its own volume set. Media failures are independent
+between the two, and recovery is a single mount.
+
+One thing already in place: the catalog is written to every volume, so the most
+critical structure in the archive is the one thing that already has thirteen
+copies.
+
+Storing files as individual objects rather than one large container also bounds
+the blast radius — damage costs the objects it touches, not everything after
+them in a stream. Worth remembering when the tar threshold is next revisited.
+
+*Unverified:* tape damage tends to be a contiguous band across the medium
+(a crease, a scratch), so parity that is striped across the tape should help
+where parity concentrated in one region would not. Confirm the geometry before
+implementing parity, rather than assuming.
+
+---
+
+## 9. Retention and reclamation
+
+Two commands, the split familiar from restic and borg's `forget`/`prune`:
+
+- `kura forget` — catalog only. Instant, touches no hardware, reversible.
+- `kura reclaim` — moves media.
+
+**Retention is an operation, not a policy.** Nothing expires on a schedule,
+nothing drops in the background. An archival tool that quietly discards history
+while nobody is watching has the failure mode backwards. The newest generation
+can never be forgotten.
+
+Forgetting frees less than intuition suggests: an object dies only when *no*
+retained generation references it, and an unchanged file is referenced by every
+generation since it was written. So it frees superseded revisions and pre-window
+deletions, not the bulk of an append-mostly archive.
+
+### 9.1 Reclamation
+
+Source the rewrite **from the backup source, not from the old volume**. The
+catalog knows what the volume holds, so the old medium never has to be mounted
+or still be readable, and disk out-reads tape by an order of magnitude.
+
+The trap: re-sourcing reproduces only the archive's *current* state, so it is
+not only deleted files that become unrecoverable but **every historical version
+the volume held**. A consent prompt listing only deletions understates the
+damage badly. This is the one operation where someone could destroy history
+believing they were tidying up.
+
+You only ever read from the old volume what you cannot get from the source, and
+whatever you read must be **staged on disk** — a single drive cannot have both
+volumes mounted. With two drives, stream directly.
+
+Stage ciphertext verbatim; an object moving between volumes does not need
+decrypting. This means the **cipher belongs per object in the catalog**, not
+only in the volume header, so a blob written under an older algorithm can
+migrate onto a newer volume without a re-encrypt.
+
+**Two reasons to reclaim, wanting opposite defaults.** For capacity, keeping
+history defeats the exercise — writing 2.41 TB to free a 2.5 TB cartridge gains
+nothing; `forget` has already done the deciding. For media retirement, keep
+everything and expect to consume an equivalent volume elsewhere. Ask which.
+
+Ordering is a safety property: choose → price the options → classify casualties
+→ stage → plan → write → **verify by digest (the gate)** → record the
+reclamation as a catalog event → release. Erase is a separate explicit command,
+so a mistake found an hour later is still recoverable.
+
+Past generations must then report themselves as partially unavailable —
+`at-gen 1` says "1,247 objects dropped in generation 12", never quietly returns
+a short answer. The time-travel property is only worth having if the catalog is
+honest about its holes.
+
+Never reclaim while the source is degraded. It is a maintenance operation, not a
+recovery one.
+
+---
+
+## 10. Interface
+
+One binary, subcommands:
+
+```
+kura init     --source /storage --backend ltfs --encrypt=contents
+kura plan     --snapshot auto-2026-09-02
+kura write    --volume LTO014        # one volume, then exits
+kura verify   --volume LTO007        # or --overdue
+kura restore  --at-gen 7 --into /restore
+
+kura forget   --keep-last 6          # catalog only, reversible
+kura reclaim  --volume LTO00001      # prices the options, then moves media
+kura repair   --volume LTO007        # re-source a damaged volume from the tree
+kura erase    --volume LTO00001      # the one irreversible step
+
+kura volumes                         # inventory, free space, health, last verified
+kura history                         # generations, dates, volumes
+kura catalog  --rebuild-from-volume  # bootstrap with no local DB
+```
+
+**One volume per invocation, then exit.** State lives in the catalog, so the next
+volume can be days later with the drive powered off in between — which is the
+failure mode that made the old `tar -M` scripts painful. Emitting a shell script
+was considered and dropped: once encryption, random IDs, catalog reconciliation
+and digest verification are in scope, a script cannot express the work.
+`--dry-run` covers the auditability a script would have bought.
+
+For a workflow with day-long pauses, **being told when to act matters more than
+having somewhere to look**. A pluggable notifier earns its place before any GUI.
+When a GUI does arrive, a TUI fits better than a web app — the operator is at a
+terminal beside the drive, and it avoids a browser dependency on a NAS reached
+over SSH.
+
+---
+
+## 11. Startup reconciliation
+
+The medium is the authority; the local database is a cache.
+
+| State | Meaning | Action |
+|---|---|---|
+| Match | Same archive, same generation | Proceed |
+| Volume ahead | Written by another machine, or after the DB was copied | Adopt the volume's catalog |
+| DB ahead | A previous write did not complete, or an older volume was inserted | **Stop.** These need opposite responses |
+| Divergent | Both advanced from a common ancestor | **Stop.** Requires explicit merge |
+| Foreign | Different archive UUID | Refuse, and name the archive it belongs to |
+| Blank | No header | Offer to initialise, with confirmation |
+
+---
+
+## 12. Implementation
+
+**Go.** The planner is Go, tested, and working; the workload is I/O-bound rather
+than CPU-bound, so AES-NI clears 160 MB/s with room to spare and Rust's
+advantage does not appear. Static single-file distribution is Go's default,
+which matters for a tool people copy onto a backup host.
+
+Both languages handle the raw SCSI this needs — `SPOUT`/`SPIN` for keys,
+`LOG SENSE` for TapeAlert, MAM reads — through `ioctl(SG_IO)`.
+
+What would change the answer: wanting the cryptographic core to carry Rust's
+guarantees, or an existing Rust codebase to sit alongside.
