@@ -64,17 +64,19 @@ Flags:
 	if err != nil {
 		fatal(err)
 	}
-	if cat.Header.Archive == "" {
-		id, err := archive.NewArchiveID()
-		if err != nil {
-			fatal(err)
-		}
-		cat.Header.Archive = id
-		fmt.Fprintf(os.Stderr, "new archive %s\n", id)
-	}
 
 	pv := pickVolume(p, cat, *volumeID)
 	if pv == nil {
+		// Deletions still have to be recorded even when there is nothing to
+		// write. A cycle that only removed files produces a plan with no
+		// volumes at all, and it is still a generation.
+		if n := cat.Tombstone(p.Deleted, p.Generation); n > 0 && !*dryRun {
+			cat.Header.Generation = max(cat.Header.Generation, p.Generation)
+			if err := catalog.Write(*catalogPath, cat.Header, cat.Records); err != nil {
+				fatal(err)
+			}
+			fmt.Printf("recorded %s as deleted at generation %d\n", count(int64(n), "path"), p.Generation)
+		}
 		fmt.Println("every volume in this plan has already been written; nothing to do")
 		return
 	}
@@ -96,6 +98,16 @@ Flags:
 		fatal(fmt.Errorf("the loaded volume is %s but the plan expects %s; load the right cartridge or pass -volume %s",
 			vol.ID(), pv.ID, vol.ID()))
 	}
+
+	if err := ensureArchiveID(ctx, cat, vol, *catalogPath, *dryRun); err != nil {
+		fatal(err)
+	}
+
+	// Applied before archive.Write, so the catalog copies this volume carries
+	// say what went away as well as what arrived. Persisting is left to the
+	// save that follows a successful write; Tombstone is idempotent, so a run
+	// that fails and is repeated re-applies them rather than losing them.
+	tombstoned := cat.Tombstone(p.Deleted, p.Generation)
 
 	written := int64(0)
 	opt := archive.Options{
@@ -138,9 +150,58 @@ Flags:
 	}
 
 	reportWrite(res, elapsed, *dryRun, *catalogPath)
+	if tombstoned > 0 {
+		fmt.Printf("  %s recorded as deleted at generation %d; the bytes stay on the volumes that hold them\n",
+			count(int64(tombstoned), "path"), p.Generation)
+	}
 	if len(res.Problems) > 0 {
 		os.Exit(1)
 	}
+}
+
+// ensureArchiveID settles which archive this catalog describes, and persists
+// that before a single object is written.
+//
+// The order is the entire point. An archive ID is minted once for the archive;
+// it is not something a volume write produces. While it was minted in memory
+// and saved only after a whole volume succeeded, any interruption in between —
+// a kill, a power cut, a medium that turned out too small — lost it, and
+// because archive.Reconcile had already stamped the medium, the next run minted
+// a different ID and refused the cartridge it had itself stamped. Permanently,
+// and the window was the entire first volume of a new archive.
+//
+// Two things close it. The ID is written to the catalog immediately, so an
+// interrupted run resumes with the identity it started with. And when the
+// catalog has no ID at all but the loaded volume already declares one, the
+// volume's is adopted rather than a second identity being minted for an archive
+// that already has one — the medium is the authority (DESIGN §11), so a catalog
+// lost entirely can still be repaired from any cartridge.
+func ensureArchiveID(ctx context.Context, cat *catalog.Catalog, vol volume.Volume, catalogPath string, dryRun bool) error {
+	if cat.Header.Archive != "" {
+		return nil
+	}
+
+	onMedium, err := archive.ArchiveIDOn(ctx, vol)
+	if err != nil {
+		return err
+	}
+	switch {
+	case onMedium != "":
+		cat.Header.Archive = onMedium
+		fmt.Fprintf(os.Stderr, "adopting archive %s from %s; the catalog did not name one\n", onMedium, vol.ID())
+	default:
+		id, err := archive.NewArchiveID()
+		if err != nil {
+			return err
+		}
+		cat.Header.Archive = id
+		fmt.Fprintf(os.Stderr, "new archive %s\n", id)
+	}
+
+	if dryRun {
+		return nil
+	}
+	return catalog.Write(catalogPath, cat.Header, cat.Records)
 }
 
 // pickVolume chooses which volume of the plan to write.

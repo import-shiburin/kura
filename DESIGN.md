@@ -93,36 +93,114 @@ way cannot be imported into key-server-managed libraries.
 Drive encryption remains available to anyone who wants it as an independent
 layer underneath. The tool need not know.
 
-### 3.1 The volume header
+### 3.1 The headers: archive-scoped and volume-scoped
 
-Exactly one object per volume stays plaintext — enough for the tool to recognise
-its own work and know how to proceed, and nothing more.
+Two objects per volume stay plaintext — enough for the tool to recognise its own
+work and know how to proceed, and nothing more.
 
 ```json
+// kura.archive.json — identical on every volume of the archive
 {
-  "magic":      "kura-volume",
+  "magic":      "kura-archive",
   "format":     1,
   "archive":    "8f14e45f-…",
-  "volume":     "c9f0f895-…",
   "encrypted":  true,
   "cipher":     "aes-256-gcm",
   "kdf":        "argon2id",
-  "kdf_params": { "salt": "…", "m": 262144, "t": 3, "p": 4 },
-  "generation": 3,
-  "written":    "2026-09-02T11:04:00Z"
+  "kdf_params": { "salt": "…", "m": 262144, "t": 3, "p": 4 }
+}
+
+// kura.volume.json — this cartridge alone
+{
+  "magic":   "kura-volume",
+  "format":  1,
+  "archive": "8f14e45f-…",
+  "volume":  "c9f0f895-…"
 }
 ```
 
-The salt must be plaintext — a passphrase cannot become a key without it. The
-cipher and KDF identifiers are what let the format outlive its own algorithms:
-**reading dispatches on what the header declares, writing always uses the
-current default.** That matters more here than in most formats, because this
+**Both are write-once, and the root holds nothing else.** This is forced by the
+medium rather than chosen for tidiness. On LTFS a modification is not a
+modification: the new bytes are appended at the current append point, the index
+is repointed, and the old blocks are abandoned — not erased, not reclaimed, not
+reused. So a header carrying a `generation` or a `written` date would cost a
+fresh copy of itself on every cycle and strand the previous one, for a field
+nobody can rewrite in place anyway.
+
+Everything that changes is therefore versioned instead, under `generations/`:
+
+```
+kura.archive.json                          write-once identity
+kura.volume.json                           write-once identity
+generations/g0001/catalog.000.jsonl.gz     the index as of generation 1
+generations/g0001/catalog.001.jsonl.gz
+generations/g0002/catalog.000.jsonl.gz     …and as of generation 2
+data/…                                     files at or above the tar threshold
+containers/g0002/…                         everything below it
+```
+
+The medium's own format already works this way: LTFS writes each index with a
+generation number, keeps the older ones, and can roll back to them. Following
+it costs nothing and makes a cartridge readable at any generation it holds.
+
+Losing `generation` and `written` from the header costs nothing that mattered.
+They were there so twenty encrypted cartridges would not be twenty identical
+bricks — and the generation directories answer that better, because how far a
+cartridge has been written is now readable from a *listing*, with no read and
+nothing unlocked. The activity timeline that §3.1 already accepted leaking is
+leaked in exactly the same measure, by names instead of by fields.
+
+**This was one object, and splitting it fixed a data-availability bug.** The
+archive ID is minted once for the archive; it is not something a volume write
+produces. While it lived only in the volume header, `write` minted it in memory,
+`Reconcile` stamped it onto the medium before the first object, and the local
+catalog was saved only after the whole volume succeeded. Any interruption in
+between — a kill, a power cut, a medium that turned out too small — lost it. The
+next run minted a different ID and refused, as foreign, the cartridge it had
+itself stamped. Permanently, and the window was the entire first volume of a new
+archive: hours on real hardware. Found by the end-to-end suite, which kills a
+write mid-flight; no in-process test had reason to look.
+
+Two things follow from the split. The identity is persisted to the catalog
+before any object is written, so an interrupted run resumes with the identity it
+started with. And because the identity is now an object of its own, **any volume
+can hand it back** — a catalog that has lost the ID adopts the medium's rather
+than minting a second identity for an archive that already has one, which is the
+"medium is the authority" rule of §11 applied to identity itself.
+
+The `archive` field is repeated in the volume header on purpose. It is redundant
+against the archive header, and that redundancy is what lets the two be
+cross-checked: a cartridge carrying pieces of two archives is *corrupt*, which
+is a different problem from *foreign* and sends the operator somewhere else.
+
+**The KDF salt is per archive.** §3.1 previously left this open, and the split
+settles it: it has to be per archive, or an object migrated between volumes
+could not be decrypted from its own record — which is exactly what §9.1 requires
+of ciphertext migration. Being byte-identical on every volume is therefore a
+property to preserve rather than an accident. The salt must be plaintext; a
+passphrase cannot become a key without it.
+
+The cipher and KDF identifiers are what let the format outlive its own
+algorithms: **reading dispatches on what the header declares, writing always uses
+the current default.** That matters more here than in most formats, because this
 medium cannot be re-encrypted in place.
 
 `generation` and `written` are the one judgement call. Strictly they leak an
 activity timeline. Without them, twenty encrypted cartridges are twenty
 identical bricks and you cannot tell which is newest without unlocking each —
 which was the entire reason for a header.
+
+The archive header is stamped before the volume header, so an interruption
+between the two leaves a cartridge whose identity is known and whose volume
+header is missing. `Reconcile` treats that as a half-finished stamp and
+completes it, because the archive check has already established that the
+identity matches.
+
+One consequence worth costing before partly-filled volumes ship:
+`PackOptions.MetadataReserve` currently holds back room for one catalog. A
+cartridge appended to across *N* cycles carries *N* catalogs, each larger than
+the last, so the reserve has to grow with expected appends rather than with
+catalog size alone.
 
 ### 3.2 Random IDs, not a keyed hash
 
@@ -221,6 +299,23 @@ records would resurrect the path. This was a real bug in the planner, caught by
 
 Deletion detection must also run over live paths only, or a file removed three
 cycles ago is reported as newly deleted forever.
+
+**Who writes the tombstone.** The scan finds deletions and the writer records
+them, so the paths travel in the plan file: nothing else survives between the
+two, and the scan's own `Delta` does not reach `write`. This was missing for
+long enough to be worth naming — `deleted_gen`, `Tombstoned`, `GoneBy` and
+`At` were all built and all tested against records whose `deleted_gen` the tests
+set by hand, so the reading half looked complete while no producer existed at
+all. `at-gen` listed files deleted generations ago and a restore of the newest
+generation recreated them. Found by the end-to-end suite; every unit test that
+touched tombstones supplied its own.
+
+Applying them is **idempotent**, and that is load-bearing rather than tidy. A
+deletion belongs to a generation, not to a cartridge, so there is no "first
+volume" to hang it on; the writer applies the whole list on every volume of the
+generation, and a cycle that only removed files produces a plan with no volumes
+at all and still has to record them. Only the newest version of each path is
+marked, per the rule above.
 
 ### 5.1 Unavailability is per version, not per path
 

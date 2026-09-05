@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -540,8 +541,9 @@ func TestForeignVolumeIsRefused(t *testing.T) {
 	}
 }
 
-// TestBlankVolumeIsStamped covers the other end: a volume with no header is
-// initialised, and reading it back identifies the archive.
+// TestBlankVolumeIsStamped covers the other end: a volume with no headers is
+// initialised, and reading them back identifies both the archive and the
+// cartridge.
 func TestBlankVolumeIsStamped(t *testing.T) {
 	f := newFixture(t, 4<<20, plan.Layout{})
 	f.write(map[string]int{"a.bin": 1024})
@@ -550,18 +552,34 @@ func TestBlankVolumeIsStamped(t *testing.T) {
 
 	vol, done := f.mount(p.Volumes[0].ID)
 	defer done()
+
 	h, err := ReadHeader(context.Background(), vol)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if h.Magic != HeaderMagic || h.Archive != "test-archive" || h.Volume != p.Volumes[0].ID {
-		t.Errorf("header does not identify the volume: %+v", h)
+		t.Errorf("volume header does not identify the volume: %+v", h)
 	}
-	if h.Encrypted {
-		t.Error("nothing here encrypts yet, but the header claims it does")
+	// The volume header carries identity only. A generation number here would
+	// have to be rewritten every cycle, which on the target medium means
+	// abandoning the old copy; generations/ carries that instead.
+	newest, err := NewestGeneration(context.Background(), vol)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if h.Generation != 1 {
-		t.Errorf("header generation %d, want 1", h.Generation)
+	if newest != 1 {
+		t.Errorf("volume reports generation %d from its object names, want 1", newest)
+	}
+
+	ah, err := ReadArchiveHeader(context.Background(), vol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ah.Magic != ArchiveMagic || ah.Archive != "test-archive" {
+		t.Errorf("archive header does not identify the archive: %+v", ah)
+	}
+	if ah.Encrypted {
+		t.Error("nothing here encrypts yet, but the archive header claims it does")
 	}
 }
 
@@ -581,7 +599,7 @@ func TestVolumeCarriesItsOwnCatalog(t *testing.T) {
 	}
 	var copies []string
 	for _, o := range objs {
-		if isCatalogObject(o.Name) {
+		if isGenerationObject(o.Name) {
 			copies = append(copies, o.Name)
 		}
 	}
@@ -787,6 +805,301 @@ func TestDryRunTouchesNothing(t *testing.T) {
 	for _, rec := range res.Records {
 		if rec.FullHash == "" {
 			t.Errorf("%s has no digest; the dry run did not actually read it", rec.Path)
+		}
+	}
+}
+
+// The archive header is stamped before the volume header, and a run that dies
+// between the two must be finishable.
+//
+// This is the state that used to be unrecoverable, and it was reachable by a
+// kill, a power cut, or a medium that turned out too small: the medium carried
+// an archive ID that the local catalog had never been told about. Reconcile now
+// treats a stamped archive header with no volume header as a half-finished
+// stamp rather than as a foreign volume, because the archive check has already
+// established that the identity matches.
+func TestReconcileFinishesAnInterruptedStamp(t *testing.T) {
+	f := newFixture(t, 4<<20, plan.Layout{})
+	ctx := context.Background()
+
+	vol, done := f.mount("LTO001")
+	if err := putJSON(ctx, vol, ArchiveObject, &ArchiveHeader{
+		Magic: ArchiveMagic, Format: HeaderFormat, Archive: "test-archive",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	done()
+
+	vol, done = f.mount("LTO001")
+	defer done()
+	h, err := Reconcile(ctx, vol, "test-archive", 1, false)
+	if err != nil {
+		t.Fatalf("a half-stamped volume of our own archive was refused: %v", err)
+	}
+	if h.Volume != "LTO001" || h.Archive != "test-archive" {
+		t.Errorf("the volume header does not identify the volume: %+v", h)
+	}
+}
+
+// ArchiveIDOn is what lets a catalog that lost its archive ID recover it from
+// any cartridge instead of minting a second identity for an archive that
+// already has one.
+func TestArchiveIDCanBeReadBackFromTheMedium(t *testing.T) {
+	f := newFixture(t, 4<<20, plan.Layout{})
+	f.write(map[string]int{"a.bin": 1024})
+	p := f.plan()
+	f.writeAll(p)
+
+	vol, done := f.mount(p.Volumes[0].ID)
+	defer done()
+	got, err := ArchiveIDOn(context.Background(), vol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "test-archive" {
+		t.Errorf("ArchiveIDOn = %q, want test-archive", got)
+	}
+}
+
+// A blank cartridge has no identity to offer, and saying so is what tells the
+// caller to mint one rather than to adopt an empty string.
+func TestArchiveIDOnABlankVolumeIsEmpty(t *testing.T) {
+	f := newFixture(t, 4<<20, plan.Layout{})
+	vol, done := f.mount("LTO001")
+	defer done()
+
+	got, err := ArchiveIDOn(context.Background(), vol)
+	if err != nil {
+		t.Fatalf("a blank volume should not be an error: %v", err)
+	}
+	if got != "" {
+		t.Errorf("ArchiveIDOn = %q on a blank volume, want empty", got)
+	}
+}
+
+// The two plaintext objects are cross-checked. A volume carrying pieces of two
+// archives is corrupt rather than foreign, and conflating the two would send
+// the operator looking for the wrong problem.
+func TestHeadersThatDisagreeAreRefused(t *testing.T) {
+	f := newFixture(t, 4<<20, plan.Layout{})
+	ctx := context.Background()
+
+	vol, done := f.mount("LTO001")
+	if err := putJSON(ctx, vol, ArchiveObject, &ArchiveHeader{
+		Magic: ArchiveMagic, Format: HeaderFormat, Archive: "test-archive",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := putJSON(ctx, vol, HeaderObject, &VolumeHeader{
+		Magic: HeaderMagic, Format: HeaderFormat, Archive: "a-different-archive", Volume: "LTO001",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	done()
+
+	vol, done = f.mount("LTO001")
+	defer done()
+	_, err := Reconcile(ctx, vol, "test-archive", 1, false)
+	if err == nil {
+		t.Fatal("a volume whose two headers name different archives was accepted")
+	}
+	if !strings.Contains(err.Error(), "disagrees") {
+		t.Errorf("the error should say the volume's own metadata disagrees: %v", err)
+	}
+	if errors.Is(err, ErrForeign) {
+		t.Error("a self-contradictory volume is corrupt, not foreign")
+	}
+}
+
+// Reconcile without an archive ID would stamp the empty string onto a blank
+// cartridge and make it unmatchable by anything afterwards.
+func TestReconcileRefusesAnEmptyArchiveID(t *testing.T) {
+	f := newFixture(t, 4<<20, plan.Layout{})
+	vol, done := f.mount("LTO001")
+	defer done()
+
+	if _, err := Reconcile(context.Background(), vol, "", 1, false); err == nil {
+		t.Fatal("Reconcile accepted an empty archive ID")
+	}
+}
+
+// The archive header is identical on every volume, which is what will let a
+// KDF salt live in it once encryption ships (DESIGN §3.1, §9.1): an object
+// migrated between volumes has to stay decryptable from its own record.
+func TestTheArchiveHeaderIsIdenticalOnEveryVolume(t *testing.T) {
+	f := newFixture(t, 1<<20, plan.Layout{TarBelow: -1})
+	f.write(map[string]int{"huge.bin": (2 << 20) + 12345})
+	p := f.plan(func(o *plan.PackOptions) {
+		o.AllowSplit = true
+		o.SplitMin = 1
+	})
+	if len(p.Volumes) < 2 {
+		t.Fatalf("this needs a multi-volume plan, got %d", len(p.Volumes))
+	}
+	f.writeAll(p)
+
+	var first []byte
+	for _, pv := range p.Volumes {
+		vol, done := f.mount(pv.ID)
+		rc, err := vol.Get(context.Background(), ArchiveObject)
+		if err != nil {
+			t.Fatalf("%s carries no archive header: %v", pv.ID, err)
+		}
+		b, err := io.ReadAll(rc)
+		rc.Close()
+		done()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if first == nil {
+			first = b
+		} else if !bytes.Equal(first, b) {
+			t.Errorf("%s carries a different archive header:\n%s\nvs\n%s", pv.ID, first, b)
+		}
+	}
+}
+
+// readCatalogObject pulls one on-volume catalog copy back into a Catalog.
+func readCatalogObject(t *testing.T, vol volume.Volume, name string) *catalog.Catalog {
+	t.Helper()
+	rc, err := vol.Get(context.Background(), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+
+	tmp := filepath.Join(t.TempDir(), "copy.jsonl.gz")
+	out, err := os.Create(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := out.ReadFrom(rc); err != nil {
+		t.Fatal(err)
+	}
+	out.Close()
+
+	cat, err := catalog.Load(tmp)
+	if err != nil {
+		t.Fatalf("%s is not a readable catalog: %v", name, err)
+	}
+	return cat
+}
+
+// A second generation written to the same cartridge must leave an index that
+// describes both, and this is the test that did not exist.
+//
+// The catalog copies were named by copy number alone, so a later generation
+// found kura.catalog.000/001 already present and skipped them — leaving the
+// volume carrying an index for the first cycle only. Silent, because nothing
+// reads the on-volume catalog back until the local one is gone, which is the
+// one moment it has to be right. The name now carries the generation, the way a
+// container's already did (DESIGN §4.1).
+func TestASecondGenerationOnTheSameVolumeGetsItsOwnCatalog(t *testing.T) {
+	f := newFixture(t, 4<<20, plan.Layout{TarBelow: -1})
+	f.write(map[string]int{"first.bin": 2048})
+	g1 := f.plan()
+	f.writeAll(g1)
+
+	f.write(map[string]int{"second.bin": 4096})
+	g2 := f.plan()
+	if g2.Generation != 2 {
+		t.Fatalf("second plan is generation %d, want 2", g2.Generation)
+	}
+	if g2.Volumes[0].ID != g1.Volumes[0].ID {
+		t.Fatalf("this test needs both generations on one cartridge, got %s then %s",
+			g1.Volumes[0].ID, g2.Volumes[0].ID)
+	}
+	f.writeAll(g2)
+
+	vol, done := f.mount(g1.Volumes[0].ID)
+	defer done()
+
+	objs, err := vol.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	byGen := map[int][]string{}
+	for _, o := range objs {
+		if g := generationOf(o.Name); g > 0 {
+			byGen[g] = append(byGen[g], o.Name)
+		}
+	}
+	for _, gen := range []int{1, 2} {
+		if len(byGen[gen]) != DefaultCatalogCopies {
+			t.Errorf("generation %d has %d catalog copies on the volume, want %d: %v",
+				gen, len(byGen[gen]), DefaultCatalogCopies, byGen[gen])
+		}
+	}
+
+	// The generation-2 copy is the one a recovery would read, and it has to
+	// know about both cycles.
+	newest := readCatalogObject(t, vol, catalogObjectName(2, 0))
+	for _, want := range []string{"first.bin", "second.bin"} {
+		if _, ok := newest.Lookup(filepath.Join(f.src, want)); !ok {
+			t.Errorf("the generation-2 catalog on the volume does not know about %s", want)
+		}
+	}
+	if newest.Header.Generation != 2 {
+		t.Errorf("the on-volume catalog says generation %d, want 2", newest.Header.Generation)
+	}
+
+	// And the generation-1 copy is left exactly as it was: write-once, so the
+	// earlier index is still there to fall back on.
+	older := readCatalogObject(t, vol, catalogObjectName(1, 0))
+	if _, ok := older.Lookup(filepath.Join(f.src, "second.bin")); ok {
+		t.Error("the generation-1 catalog was rewritten; it should still describe generation 1 only")
+	}
+}
+
+// NewestGeneration answers "how far has this cartridge been written?" from
+// object names, which is what replaced the generation field the volume header
+// used to carry.
+func TestNewestGenerationComesFromTheListing(t *testing.T) {
+	f := newFixture(t, 4<<20, plan.Layout{TarBelow: -1})
+
+	vol, done := f.mount("V000")
+	got, err := NewestGeneration(context.Background(), vol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 0 {
+		t.Errorf("a blank volume reports generation %d, want 0", got)
+	}
+	done()
+
+	// Different lengths of name and of content: the fixture derives bytes from
+	// len(name), so two same-length names produce identical files and the
+	// second is classified as a re-added duplicate rather than as new.
+	f.write(map[string]int{"alpha.bin": 2048})
+	f.writeAll(f.plan())
+	f.write(map[string]int{"beta-two.bin": 4096})
+	f.writeAll(f.plan())
+
+	vol, done = f.mount("V000")
+	defer done()
+	got, err = NewestGeneration(context.Background(), vol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 2 {
+		t.Errorf("NewestGeneration = %d after two cycles, want 2", got)
+	}
+}
+
+func TestGenerationOfParsesOnlyItsOwnNamespace(t *testing.T) {
+	for name, want := range map[string]int{
+		"generations/g0001/catalog.000.jsonl.gz": 1,
+		"generations/g0042/catalog.001.jsonl.gz": 42,
+		"generations/g0000/catalog.000.jsonl.gz": 0,
+		"generations/nope/catalog.000.jsonl.gz":  0,
+		"generations/gxx/catalog.000.jsonl.gz":   0,
+		"generations/g0001":                      0,
+		"containers/g0001/x.part001.tar":         0,
+		"data/storage/film.mkv":                  0,
+		"kura.volume.json":                       0,
+	} {
+		if got := generationOf(name); got != want {
+			t.Errorf("generationOf(%q) = %d, want %d", name, got, want)
 		}
 	}
 }

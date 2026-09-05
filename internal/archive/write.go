@@ -145,7 +145,13 @@ func Write(ctx context.Context, vol volume.Volume, pv *plan.Volume, cat *catalog
 
 	// The records go into the catalog before it is written to the volume, so
 	// the copy the medium carries describes the volume it is on.
+	//
+	// The generation goes in for the same reason. Setting it in the caller
+	// after Write returned left every on-volume copy claiming generation 0 —
+	// invisible while nothing reads those copies back, and wrong on the one day
+	// something has to.
 	cat.Add(w.res.Records...)
+	cat.Header.Generation = max(cat.Header.Generation, opt.Generation)
 	info := cat.Header.Volume(vol.ID())
 	if info.Written == "" {
 		info.Written = time.Now().UTC().Format(time.RFC3339)
@@ -500,12 +506,14 @@ func (w *writer) writeCatalog(ctx context.Context, cat *catalog.Catalog) error {
 	}
 
 	for i := range w.opt.catalogCopies() {
-		name := catalogObjectName(i)
+		name := catalogObjectName(w.opt.Generation, i)
 		if _, done := w.present[name]; done {
-			// A resumed run finds last attempt's copies. They describe fewer
-			// records than this one does, so the fresh copies go under the next
-			// free numbers rather than replacing them: names are write-once,
-			// and a stale index that still parses is worse than an extra one.
+			// Only reachable when this same generation was interrupted after
+			// placing a copy. Its content is already complete — writeCatalog
+			// runs after every object — so skipping is right. A *later*
+			// generation cannot land here at all now that the name carries the
+			// generation, which is what used to leave a volume describing only
+			// the first cycle that touched it.
 			continue
 		}
 		if err := w.vol.Put(ctx, name, int64(len(b)), bytesReader(b)); err != nil {

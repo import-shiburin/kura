@@ -64,7 +64,10 @@ func Verify(ctx context.Context, vol volume.Volume, cat *catalog.Catalog, mark b
 	res := &VerifyResult{Volume: vol.ID()}
 
 	records := cat.OnVolume(vol.ID())
-	claimed := map[string]bool{HeaderObject: true}
+	// Both plaintext metadata objects are accounted for by existing rather than
+	// by a catalog record; an unclaimed report on them would be noise on every
+	// single verify.
+	claimed := map[string]bool{HeaderObject: true, ArchiveObject: true}
 
 	// Group container members so each container is read once, in one pass,
 	// rather than once per member. On tape that is the difference between a
@@ -89,7 +92,7 @@ func Verify(ctx context.Context, vol volume.Volume, cat *catalog.Catalog, mark b
 		return nil, err
 	}
 	for _, o := range objs {
-		if !claimed[o.Name] && !isCatalogObject(o.Name) {
+		if !claimed[o.Name] && !isGenerationObject(o.Name) {
 			res.Unclaimed = append(res.Unclaimed, o.Name)
 		}
 	}

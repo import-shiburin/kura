@@ -85,6 +85,13 @@ func (p *Plan) Finalize(d *scan.Delta, stats *scan.Stats, items []Item) {
 	s.ReusedBytes = d.ReusedBytes
 	s.DeletedFiles = int64(len(d.Deleted))
 	s.DeletedBytes = d.DeletedBytes
+
+	// The paths themselves, not just the count: the writer has to be able to
+	// tombstone them, and the count alone is only a report.
+	p.Deleted = make([]string, 0, len(d.Deleted))
+	for _, rec := range d.Deleted {
+		p.Deleted = append(p.Deleted, rec.Path)
+	}
 	s.ReplacingLost = d.ReplacingLost
 	s.HashedFiles = d.HashedFiles
 	s.HashedBytes = d.HashedBytes

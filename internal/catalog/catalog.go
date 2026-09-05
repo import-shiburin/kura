@@ -440,6 +440,32 @@ func (c *Catalog) Lookup(path string) (*Record, bool) {
 // Versions returns every recorded version of a path, oldest first.
 func (c *Catalog) Versions(path string) []*Record { return c.byPath[path] }
 
+// Tombstone records that these paths stopped existing at generation gen, and
+// returns how many records it actually marked.
+//
+// Only the newest version of each path is marked, which is the whole of DESIGN
+// §5: whether a path exists is a property of its newest version, and an older
+// version keeps DeletedGen zero because its bytes are still the correct answer
+// for every generation before the edit. Marking every version would make a
+// point-in-time restore of an earlier generation lose the file as well.
+//
+// Idempotent, and that is load-bearing rather than tidy. Deletions belong to a
+// generation, not to a cartridge, so the writer applies them on every volume of
+// that generation — there is no "first volume" to hang them on, and a plan with
+// no volumes at all still has deletions to record.
+func (c *Catalog) Tombstone(paths []string, gen int) int {
+	marked := 0
+	for _, p := range paths {
+		r := c.newest(p, gen)
+		if r == nil || r.Tombstoned() {
+			continue
+		}
+		r.DeletedGen = gen
+		marked++
+	}
+	return marked
+}
+
 // LiveRecords returns one record per path that still exists on disk.
 //
 // Deletion detection has to run over these rather than over every record: a

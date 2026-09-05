@@ -98,9 +98,10 @@ snapshot being renamed each cycle.
 Nothing about the layout needs this tool to read it back:
 
 ```
-kura.volume.json                 what archive and volume this is
-kura.catalog.000.jsonl.gz        the index, written twice per volume
-kura.catalog.001.jsonl.gz
+kura.archive.json                what archive this is, and how it is encrypted
+kura.volume.json                 which cartridge of it this one is
+generations/g0001/catalog.000.jsonl.gz    the index, written twice per cycle
+generations/g0001/catalog.001.jsonl.gz
 data/storage/Movie/film.mkv      files large enough to be worth addressing
 containers/g0001/storage/Docs.part001.tar    everything small, bundled for speed
 ```
@@ -113,6 +114,7 @@ The containers are ordinary tars.
 
 - [DESIGN.md](DESIGN.md) — the settled decisions and why they went that way.
 - [CLAUDE.md](CLAUDE.md) — working context: measurements, conventions, state.
+- [TESTING.md](TESTING.md) — coverage and the end-to-end VM suite.
 
 ## Building
 
@@ -123,3 +125,19 @@ CGO_ENABLED=0 go build ./cmd/kura
 
 Standard library only, so the binary is static and copies onto a backup host
 with nothing to install alongside it.
+
+## Testing
+
+```sh
+make cover        # unit coverage, per package, against the floors it must hold
+make cover-todo   # the biggest uncovered blocks, worst first
+make e2e          # every end-to-end scenario, each in its own NixOS VM
+make cover-all    # unit and end-to-end coverage merged into one number
+```
+
+The end-to-end suite boots a machine per scenario with real block devices
+standing in for cartridges, so a full medium, a swapped cartridge and a power
+cut are the real thing rather than a simulation. Its binary is built with Go's
+coverage instrumentation, which puts driving the actual CLI in the same report
+as the unit tests. [TESTING.md](TESTING.md) has the rest, including how to add
+a scenario — it is one file, and nothing else changes.

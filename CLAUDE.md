@@ -96,13 +96,14 @@ restore.
 | | |
 |---|---|
 | `internal/volume` + `filevol` | the backend seam and directory-as-volume — 17 tests |
-| `internal/catalog` | records, history queries, `Lost`, per-object cipher — 20 tests |
+| `internal/catalog` | records, history queries, `Lost`, `Tombstone`, per-object cipher — 25 tests |
 | `internal/scan` | walk, exclusions, hashing, `Diff` — 38 tests |
-| `internal/plan` | `Group`, `Layout`, `Pack` — 32 tests |
-| `internal/archive` | `Write`, `Verify`, `Restore`, containers, volume header — 15 tests |
+| `internal/plan` | `Group`, `Layout`, `Pack` — 34 tests |
+| `internal/archive` | `Write`, `Verify`, `Restore`, containers, both headers — 24 tests |
 | `cmd/kura` | `plan`, `write`, `verify`, `restore`, `volumes`, `history`, `at-gen` — 10 tests |
+| `nix/e2e/scenarios` | seven NixOS VMs: real cartridges, swaps, ENOSPC, power cuts — see [TESTING.md](TESTING.md) |
 
-132 tests. Exercised against a real 356-file tree across six volumes: written,
+148 tests. Exercised against a real 356-file tree across six volumes: written,
 verified, restored byte-identical, then a flipped byte inside a container caught
 and attributed to the one file it damaged, marked lost, and re-sourced by the
 next plan.
@@ -135,8 +136,9 @@ keeping straight:
 **On-media layout**, all names relative so nothing can escape a volume:
 
 ```
-kura.volume.json              the one plaintext object (DESIGN §3.1)
-kura.catalog.NNN.jsonl.gz     the index, written twice (DESIGN §8.1a)
+kura.archive.json             archive identity and cipher — write-once
+kura.volume.json              archive ID + volume ID, nothing else — write-once
+generations/gNNNN/catalog.NNN.jsonl.gz   the index at that generation, twice
 data/<path>                   files at or above the tar threshold
 data/<path>.partNNN           one fragment of a split file
 containers/gNNNN/<item>.partNNN.tar   everything below the threshold
@@ -148,13 +150,23 @@ containers/gNNNN/<item>.partNNN.tar   everything below the threshold
 ## Conventions
 
 - **Standard library only.** The binary has to copy onto a backup host and run.
-  A dependency needs an argument.
+  A dependency needs an argument. Test tooling lives outside the module —
+  `tools/covcheck/` has its own `go.mod`, and the VM suite is Nix — so
+  `go list -deps ./...` stays empty of anything but the standard library.
 - Tests carry the reasoning for anything non-obvious, in the test name and a
   comment. Several existing tests document a bug that was actually hit —
   `TestDeletionAfterRewriteStaysDeleted`, `TestCTimeCatchesContentChange…`,
   `TestScanOverlappingRootsCountsOnce`. Do not "simplify" those away.
 - `gofmt -w . && go vet ./... && go test ./...` before calling anything done.
 - Comments explain *why*, not what. The what is in the code.
+- **Coverage is a contract, not a report.** `.covcheck.json` holds a floor per
+  package; `make cover-gate` enforces them and `covcheck ratchet` raises them.
+  Floors only go up automatically — lowering one is a hand edit whose diff
+  carries the argument.
+- **Anything that only fails on real media gets an e2e scenario**, not a mock.
+  A full medium, a swapped cartridge, a power cut mid-write and ctime at
+  nanosecond resolution are all in `nix/e2e/scenarios/`, one VM each. Adding
+  one is a single file — see [TESTING.md](TESTING.md).
 
 ## Things that will bite
 
@@ -179,6 +191,13 @@ containers/gNNNN/<item>.partNNN.tar   everything below the threshold
   the truth or a volume the plan said would fit will not.
 - **Overwriting an object name is an error**, not a replace. On media that never
   reclaims space, a repeated name means the catalog lost track of what it stored.
+- **Nothing mutable goes at the root of a volume.** LTFS does not modify a file;
+  it appends the new bytes and abandons the old blocks. So a header field that
+  changes costs a fresh copy every cycle and strands the last one. The root
+  carries write-once identity, and anything per-cycle lives under
+  `generations/gNNNN/`. This was got wrong once: the catalog was named by copy
+  number, so a second generation on the same cartridge found the names taken and
+  skipped them, leaving an index describing only the first cycle.
 - **Object names are untrusted input.** They arrive from a catalog that may have
   been read off a volume someone else wrote. `filevol.resolve` refuses anything
   escaping the volume; any new backend needs the same.
@@ -220,13 +239,6 @@ intuition.
   puts them in `Delta.Metadata` and nothing turns them into catalog records, so
   a restore does not recreate them. They carry no data, so this is a catalog
   gap rather than a data-loss one, but a restored tree is not yet faithful.
-- **A cipher names an algorithm, not a key.** DESIGN §9.1 puts the cipher per
-  object so ciphertext can migrate between volumes without re-encrypting, and
-  `catalog.Record.Cipher` does that. But §3.1 puts the KDF salt in each volume
-  header without saying whether it is per archive or per volume. If it is per
-  volume, a migrated object cannot be decrypted from its record alone and needs
-  a second field naming the header its key came from. Settle it before
-  encryption ships — it is a schema question, so it is free now.
 - **No way to feed in partly-filled volumes.** `plan.Pack` still takes them, but
   nothing supplies them: free space has to be read from a mounted volume rather
   than trusted from a file, and `plan` has no backend. Every cycle therefore

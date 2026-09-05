@@ -1,6 +1,7 @@
 package plan
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -128,5 +129,58 @@ func TestPlanCarriesSourcePaths(t *testing.T) {
 	}
 	if !strings.HasPrefix(e.Source, snap+"/") {
 		t.Errorf("entry source %q should point into the snapshot", e.Source)
+	}
+}
+
+// The deleted paths have to survive into the plan file, not just their count.
+//
+// A deletion is discovered by the scan and applied by the writer, and nothing
+// carries the scan's findings between the two except this file. While only the
+// count travelled, `kura write` had no way to record that anything had gone
+// away — the report said "tombstoned, data retained" and nothing was
+// tombstoned.
+func TestPlanCarriesTheDeletedPathsNotJustTheCount(t *testing.T) {
+	cat := catalog.New()
+	cat.Add(
+		&catalog.Record{Path: "/storage/gone-a", Size: 10, Volume: "V001", Gen: 1},
+		&catalog.Record{Path: "/storage/gone-b", Size: 20, Volume: "V001", Gen: 1},
+		&catalog.Record{Path: "/storage/stays", Size: 30, Volume: "V001", Gen: 1},
+	)
+	// Only "stays" is still on disk, so the other two are deletions.
+	files := []*scan.File{{Path: "/storage/stays", Size: 30}}
+	d := scan.Diff(files, cat, scan.Options{Match: scan.MatchOff}, func(string, error) {})
+
+	p := &Plan{Generation: 2}
+	p.Finalize(d, &scan.Stats{Files: 1, Bytes: 30}, nil)
+
+	if p.Summary.DeletedFiles != 2 {
+		t.Fatalf("summary counted %d deletions, want 2", p.Summary.DeletedFiles)
+	}
+	got := map[string]bool{}
+	for _, path := range p.Deleted {
+		got[path] = true
+	}
+	if !got["/storage/gone-a"] || !got["/storage/gone-b"] {
+		t.Errorf("plan.Deleted = %v, want both deleted paths", p.Deleted)
+	}
+	if got["/storage/stays"] {
+		t.Error("a path that is still on disk was listed as deleted")
+	}
+}
+
+// The plan file is what the writer reads back, so the paths have to survive
+// JSON as well as Finalize.
+func TestDeletedPathsSurviveThePlanFile(t *testing.T) {
+	p := &Plan{Format: Format, Generation: 2, Deleted: []string{"/storage/gone"}}
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back Plan
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatal(err)
+	}
+	if len(back.Deleted) != 1 || back.Deleted[0] != "/storage/gone" {
+		t.Errorf("Deleted = %v after a round trip through the plan file", back.Deleted)
 	}
 }

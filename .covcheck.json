@@ -1,0 +1,31 @@
+{
+  "comment": [
+    "The coverage contract. Floors, not targets: a build fails when a package",
+    "drops below its number, and `covcheck ratchet` raises the numbers to",
+    "whatever the suite actually reaches. Floors only ever go up automatically;",
+    "lowering one is a hand edit whose diff has to carry the argument.",
+    "",
+    "Per package rather than one total, because a single number lets a",
+    "well-tested package pay for a neglected one and says nothing about where",
+    "to work next. `covcheck uncovered` answers that.",
+    "",
+    "These floors describe the WHOLE suite: unit tests plus the NixOS VM",
+    "scenarios, merged. `make cover` alone is unit-only and prints no floors,",
+    "because most of what reaches cmd/kura arrives from the scenarios. For a",
+    "verdict run `make cover-gate` or `nix build .#coverage`.",
+    "",
+    "Excluding something is allowed and requires a reason in the entry."
+  ],
+  "goal": 100,
+  "total": 86.3,
+  "default": 0,
+  "packages": {
+    "kura/cmd/kura": 87,
+    "kura/internal/archive": 78.6,
+    "kura/internal/catalog": 88.7,
+    "kura/internal/plan": 94.1,
+    "kura/internal/scan": 91,
+    "kura/internal/volume": 100,
+    "kura/internal/volume/filevol": 81.1
+  }
+}

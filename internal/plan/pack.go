@@ -104,9 +104,19 @@ type Plan struct {
 	Generation int    `json:"generation"`
 	Created    string `json:"created"`
 
-	Volumes  []*Volume `json:"volumes"`
-	Summary  Summary   `json:"summary"`
-	Warnings []string  `json:"warnings,omitempty"`
+	Volumes []*Volume `json:"volumes"`
+
+	// Deleted is the paths that stopped existing in this generation.
+	//
+	// It has to travel in the plan file because the scan that found them does
+	// not survive into the writer, and because a deletion is a fact about this
+	// generation rather than about any one volume. Without it the writer has no
+	// way to record that anything went away, which is how deletions came to be
+	// detected, counted, reported and then discarded.
+	Deleted []string `json:"deleted,omitempty"`
+
+	Summary  Summary  `json:"summary"`
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // PackOptions controls bin packing.

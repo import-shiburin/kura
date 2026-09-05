@@ -10,6 +10,11 @@ plan.json
 /lists/
 /stage/
 
+# Coverage output and nix build symlinks
+/coverage/
+/result
+/result-*
+
 # Editor and OS debris
 .DS_Store
 *.swp

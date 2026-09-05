@@ -495,3 +495,102 @@ func TestObjectNameFallsBackToPath(t *testing.T) {
 		t.Errorf("ObjectName() = %q, want the recorded object name", got)
 	}
 }
+
+// Tombstone is the producer side of DESIGN §5, and it went missing for long
+// enough to be worth naming: DeletedGen, Tombstoned, GoneBy, At and Diff were
+// all built and all tested, against records whose DeletedGen the tests set by
+// hand. Nothing ever set it in anger, so `at-gen` listed files deleted
+// generations ago and a restore of the newest generation recreated them.
+func TestTombstoneMarksPathsAsGone(t *testing.T) {
+	cat := catalogOf(
+		&Record{Path: "/storage/x", Size: 10, Volume: "LTO001", Gen: 1},
+		&Record{Path: "/storage/y", Size: 20, Volume: "LTO001", Gen: 1},
+	)
+
+	if n := cat.Tombstone([]string{"/storage/x"}, 2); n != 1 {
+		t.Fatalf("Tombstone marked %d records, want 1", n)
+	}
+	if _, ok := cat.Lookup("/storage/x"); ok {
+		t.Error("the path was deleted at generation 2 and must not look up as live")
+	}
+	if _, ok := cat.Lookup("/storage/y"); !ok {
+		t.Error("an untouched path must stay live")
+	}
+	if findPath(cat.At(1), "/storage/x") == nil {
+		t.Error("At(1): the path existed then and must still be restorable")
+	}
+	if r := findPath(cat.At(2), "/storage/x"); r != nil {
+		t.Errorf("At(2): the path was gone, but got %+v", r)
+	}
+}
+
+// The rule DESIGN §5 calls load-bearing: existence is a property of the newest
+// version. Marking every version instead would take the path out of every past
+// generation too, which is the opposite of what an archive that never reclaims
+// space is for.
+func TestTombstoneMarksOnlyTheNewestVersion(t *testing.T) {
+	cat := catalogOf(
+		&Record{Path: "/storage/x", Size: 10, Volume: "LTO001", Gen: 1},
+		&Record{Path: "/storage/x", Size: 15, Volume: "LTO002", Gen: 3},
+	)
+	cat.Tombstone([]string{"/storage/x"}, 5)
+
+	versions := cat.Versions("/storage/x")
+	if versions[0].Tombstoned() {
+		t.Error("the generation-1 version was tombstoned; its bytes are still the right answer for generations 1 and 2")
+	}
+	if !versions[1].Tombstoned() {
+		t.Error("the newest version was not tombstoned")
+	}
+	if r := findPath(cat.At(2), "/storage/x"); r == nil || r.Size != 10 {
+		t.Errorf("At(2) should still give the 10-byte version, got %+v", r)
+	}
+}
+
+// Deletions belong to a generation, not to a cartridge, so the writer applies
+// them once per volume of that generation. Re-marking has to be free, and must
+// never move a tombstone forward onto a later generation than the one the path
+// actually disappeared in.
+func TestTombstoneIsIdempotent(t *testing.T) {
+	cat := catalogOf(&Record{Path: "/storage/x", Size: 10, Volume: "LTO001", Gen: 1})
+
+	if n := cat.Tombstone([]string{"/storage/x"}, 2); n != 1 {
+		t.Fatalf("first Tombstone marked %d, want 1", n)
+	}
+	for _, gen := range []int{2, 3, 4} {
+		if n := cat.Tombstone([]string{"/storage/x"}, gen); n != 0 {
+			t.Errorf("Tombstone at generation %d marked %d records, want 0", gen, n)
+		}
+	}
+	if got := cat.Versions("/storage/x")[0].DeletedGen; got != 2 {
+		t.Errorf("DeletedGen = %d, want it pinned at 2", got)
+	}
+}
+
+// A path the catalog has never heard of is not an error. The writer applies the
+// plan's deletion list on every volume, and a plan can outlive the catalog
+// state it was computed against.
+func TestTombstoneIgnoresUnknownPaths(t *testing.T) {
+	cat := catalogOf(&Record{Path: "/storage/x", Size: 10, Gen: 1})
+	if n := cat.Tombstone([]string{"/storage/nope", ""}, 2); n != 0 {
+		t.Errorf("Tombstone marked %d records for paths that do not exist, want 0", n)
+	}
+}
+
+// Diff already treats a tombstoned record as absent, so a path that comes back
+// is genuinely new rather than unchanged. Worth pinning: it is what makes a
+// delete-then-restore cycle write the bytes again instead of trusting a record
+// whose path no longer exists.
+func TestATombstonedPathThatReturnsIsNotFoundLive(t *testing.T) {
+	cat := catalogOf(&Record{Path: "/storage/x", Size: 10, Gen: 1})
+	cat.Tombstone([]string{"/storage/x"}, 2)
+
+	if _, ok := cat.Lookup("/storage/x"); ok {
+		t.Fatal("a tombstoned path must not look up as live")
+	}
+	cat.Add(&Record{Path: "/storage/x", Size: 99, Gen: 3})
+	r, ok := cat.Lookup("/storage/x")
+	if !ok || r.Size != 99 {
+		t.Errorf("re-adding the path should make it live again at the new version, got %+v", r)
+	}
+}
