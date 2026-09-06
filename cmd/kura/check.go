@@ -16,6 +16,7 @@ import (
 )
 
 func runVerify(argv []string) {
+	argv, allowAnyDir := takeHiddenFlag(argv, hiddenAnyDir)
 	fs := flag.NewFlagSet("verify", flag.ExitOnError)
 	var (
 		catalogPath = fs.String("catalog", "", "catalog to check against and update (required)")
@@ -55,6 +56,9 @@ Flags:
 
 	cat, err := catalog.Load(*catalogPath)
 	if err != nil {
+		fatal(err)
+	}
+	if err := requireMountPoint(*mount, allowAnyDir); err != nil {
 		fatal(err)
 	}
 	ctx := context.Background()
@@ -113,6 +117,7 @@ Flags:
 }
 
 func runRestore(argv []string) {
+	argv, allowAnyDir := takeHiddenFlag(argv, hiddenAnyDir)
 	fs := flag.NewFlagSet("restore", flag.ExitOnError)
 	var (
 		catalogPath = fs.String("catalog", "", "catalog to restore from (required)")
@@ -159,6 +164,9 @@ Flags:
 		fatal(fmt.Errorf("the catalog is empty; there is nothing to restore"))
 	}
 
+	if err := requireMountPoint(*mount, allowAnyDir); err != nil {
+		fatal(err)
+	}
 	ctx := context.Background()
 	backend, vol, err := openDrive(ctx, *mount, 0)
 	if err != nil {

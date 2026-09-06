@@ -17,6 +17,7 @@ import (
 )
 
 func runWrite(argv []string) {
+	argv, allowAnyDir := takeHiddenFlag(argv, hiddenAnyDir)
 	fs := flag.NewFlagSet("write", flag.ExitOnError)
 	var (
 		planPath    = fs.String("plan", "plan.json", "plan to execute")
@@ -81,6 +82,10 @@ Flags:
 		}
 		fmt.Println("every volume in this plan has already been written; nothing to do")
 		return
+	}
+
+	if err := requireMountPoint(*mount, allowAnyDir); err != nil {
+		fatal(err)
 	}
 
 	// Declaring the plan's capacity to the backend is what makes "the volume

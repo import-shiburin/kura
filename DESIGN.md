@@ -766,6 +766,30 @@ One rule covers it: **whoever mounted it unmounts it.** `-eject` alongside
 `-mount` is refused rather than obeyed, because kura did not make that mount and
 will not take it away.
 
+**`-mount` is checked against the kernel's mount table**, and a path that is not
+the root of a mounted filesystem is refused. This is the one input error nothing
+downstream can catch. A mistyped path, or a cartridge nobody pushed in, leaves
+an ordinary directory — and a directory is exactly what the file backend expects
+to be handed, so every later check agrees with it: objects are written, the
+catalog records the volume as stored, the command exits zero, and the archive
+finds out at the next restore. By then the only evidence, that the path was not
+a mount, is gone. The refusal names the filesystem the bytes would have landed
+on, since "you were about to fill `/dev/sdb1`" is what tells an operator what
+they actually did.
+
+`/proc/self/mountinfo` is the authority rather than comparing `st_dev` against
+the parent directory: a bind mount shares its device number with what it binds,
+so the `st_dev` test would refuse a real mount, and mountinfo yields the
+filesystem type in the same read — which is what §10.1 needs anyway to tell
+`fuse.ltfs` from ext4.
+
+The escape hatch is `-allow-any-dir`, and it is **not registered as a flag** —
+it is stripped from argv before parsing, so no help text mentions it. That is
+deliberate rather than coy. The check exists to catch an unmounted cartridge,
+and an operator who meets the switch in a listing of flags has been invited to
+defeat it; it is for the test suite and for a developer pointing a command at a
+temp directory.
+
 **kura never mounts a block device.** Given only a device it cannot know the
 filesystem. `mount(2)` — which is all a standard-library-only binary has — takes
 an explicit type; `-t auto` lives in mount(8) and libblkid, not in the syscall,

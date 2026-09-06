@@ -53,6 +53,22 @@
         assert header["volume"] == volumes[0], f"stamped as {header['volume']}, plan said {volumes[0]}"
         unload(machine)
 
+    with subtest("writing with nothing mounted is refused"):
+        # The operator ran the command before pushing the cartridge in. /mnt/lto
+        # is then an empty directory on the root filesystem, and every check
+        # below this one would pass: the file backend is handed a directory
+        # either way, so the write would exit zero and the catalog would record
+        # a volume that is on no medium. Only the mount itself can say.
+        machine.fail("mountpoint -q /mnt/lto")
+        out = kura(
+            machine, "write", "-plan", PLAN, "-catalog", CATALOG,
+            "-mount", "/mnt/lto", check=False,
+        )
+        assert_contains(out, "is not a mount point", "unmounted path")
+        assert_contains(out, "on no medium", "unmounted path")
+        left = machine.succeed("find /mnt/lto -type f | wc -l").strip()
+        assert left == "0", f"a refused write left {left} files on the host's disk"
+
     with subtest("re-inserting a written cartridge when the plan wants the next one is refused"):
         # The operator forgot to swap. The medium says volume one, the plan has
         # moved on to volume two, and that disagreement is the check.

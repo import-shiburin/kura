@@ -216,6 +216,13 @@ containers/gNNNN/<item>.partNNN.tar   everything below the threshold
   compared the medium's header against a path the operator had chosen, and
   agreed with itself. `Reconcile` takes the expected volume from the plan; a
   blank cartridge becomes it, a written one is checked against it. DESIGN §3.1.
+- **`-mount` must be a real mount point.** `write`, `verify` and `restore` check
+  it against `/proc/self/mountinfo` and refuse a bare directory, because an
+  unmounted path is the one operator error no later check can catch: the file
+  backend is handed a directory either way, so the write succeeds and the
+  catalog records a volume that is on no medium. A test or a local run against a
+  temp directory needs `-allow-any-dir`, which is stripped from argv rather than
+  registered so that no `-h` can advertise it. DESIGN §10.1.
 - **Never rely on mtime alone.** See DESIGN §6. Ctime is nanoseconds, mtime is
   seconds, and that asymmetry is deliberate.
 - **We correct no errors.** Every layer below either corrects silently or

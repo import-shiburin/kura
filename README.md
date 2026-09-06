@@ -91,6 +91,8 @@ swap.
 
 `-mount` is just where the medium is mounted — the same path every time. It is a
 mount point and not a device: mount the medium yourself and point kura at it.
+A path that is not a mounted filesystem is refused, because an unmounted one
+would quietly fill the host's disk and record a volume that is on no medium.
 Which cartridge is in it is read from the volume itself, so loading the wrong one
 is refused instead of silently written over, and a blank one becomes whatever
 volume the plan asked for.
