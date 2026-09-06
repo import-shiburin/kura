@@ -38,8 +38,7 @@
         out = kura(
             machine, "plan",
             "-root", STORAGE,
-            "-catalog", CATALOG,
-            "-out", PLAN,
+            "-workdir", WORKDIR,
             "-capacity", "96MB",
             "-max-group", "64MB",
             "-tar-below", "1MB",
@@ -96,7 +95,7 @@
         unload(machine)
 
     with subtest("the inventory knows the volumes and that none has been verified"):
-        out = kura(machine, "volumes", "-catalog", CATALOG)
+        out = kura(machine, "volumes", "-workdir", WORKDIR)
         for vid in volumes:
             assert_contains(out, vid, "volume inventory")
         assert_contains(out, "never", "unverified volumes")
@@ -107,7 +106,7 @@
             assert_contains(out, "Clean.", f"verify of {vid}")
 
     with subtest("verification is recorded, so the inventory stops nagging"):
-        out = kura(machine, "volumes", "-catalog", CATALOG)
+        out = kura(machine, "volumes", "-workdir", WORKDIR)
         assert "never" not in out, f"a volume is still unverified after a full pass:\n{out}"
 
     with subtest("restoring every volume reproduces the tree byte for byte"):
@@ -116,7 +115,7 @@
         assert_trees_identical(machine, STORAGE, restored_path("/tmp/restored"))
 
     with subtest("history shows the one generation this cycle made"):
-        out = kura(machine, "history", "-catalog", CATALOG)
+        out = kura(machine, "history", "-workdir", WORKDIR)
         assert_contains(out, "1", "generation timeline")
 
     with subtest("a later generation appended to a written cartridge gets its own index"):
@@ -133,7 +132,7 @@
         mktree(machine, "mutate", STORAGE, "--seed", 77, "--add", 3)
         kura(
             machine, "plan",
-            "-root", STORAGE, "-catalog", CATALOG, "-out", PLAN,
+            "-root", STORAGE, "-workdir", WORKDIR,
             "-capacity", "96MB", "-max-group", "64MB", "-start", 1,
         )
         later = plan_volumes(machine)

@@ -13,6 +13,7 @@ import (
 	"bufio"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -337,6 +338,13 @@ type GenerationInfo struct {
 	Written string   `json:"written"`
 	Volumes []string `json:"volumes,omitempty"`
 	Note    string   `json:"note,omitempty"`
+
+	// Plan is the plan that produced this generation. A cycle spans days and
+	// one invocation per cartridge, so the only thing tying its volumes
+	// together is that they came from the same plan; recording it is what lets
+	// a later volume of the cycle refuse a plan that is not the one the cycle
+	// started with. Empty for generations written before this was recorded.
+	Plan string `json:"plan,omitempty"`
 }
 
 // Catalog is the in-memory view of everything ever written to media.
@@ -605,6 +613,58 @@ func Load(path string) (*Catalog, error) {
 	c.index()
 	return c, nil
 }
+
+// ReadHeader reads only a catalog's header line, and reports ErrNoHeader for a
+// file that has none.
+//
+// Load pulls in every record, which is 1.16 GB of heap and six seconds at the
+// real archive's 1.66 M paths. Answering "which archive is this?" is worth one
+// line, not that — and identity is asked before anything else, on every command
+// that has to resolve a workdir.
+func ReadHeader(path string) (Header, error) {
+	var h Header
+	f, err := os.Open(path)
+	if err != nil {
+		return h, err
+	}
+	defer f.Close()
+
+	var r io.Reader = f
+	if strings.HasSuffix(path, ".gz") {
+		gz, err := gzip.NewReader(f)
+		if err != nil {
+			return h, fmt.Errorf("gzip: %w", err)
+		}
+		defer gz.Close()
+		r = gz
+	}
+
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	for sc.Scan() {
+		b := sc.Bytes()
+		if len(b) == 0 {
+			continue
+		}
+		if !looksLikeHeader(b) {
+			return h, ErrNoHeader
+		}
+		if err := json.Unmarshal(b, &h); err != nil {
+			return h, fmt.Errorf("catalog header: %w", err)
+		}
+		return h, nil
+	}
+	if err := sc.Err(); err != nil {
+		return h, err
+	}
+	return h, ErrNoHeader
+}
+
+// ErrNoHeader marks a catalog whose first line is a record rather than a
+// header. Load accepts that — the header is optional there — so a caller that
+// wants the identity has to be told it is not available rather than handed a
+// zero value it cannot tell apart from an empty archive.
+var ErrNoHeader = errors.New("catalog: no header line")
 
 func looksLikeHeader(b []byte) bool {
 	var probe struct {

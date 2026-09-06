@@ -29,14 +29,13 @@
     machine.start()
     machine.wait_for_unit("multi-user.target")
 
-    FOREIGN = "/var/lib/kura/foreign.jsonl.gz"
-    FOREIGN_PLAN = "/var/lib/kura/foreign-plan.json"
+    FOREIGN = "/var/lib/kura/foreign"
 
     with subtest("a tree that needs more than one cartridge"):
         make_source(machine, spec="tiny=100,small=40,medium=4", seed=23)
         kura(
             machine, "plan",
-            "-root", STORAGE, "-catalog", CATALOG, "-out", PLAN,
+            "-root", STORAGE, "-workdir", WORKDIR,
             "-capacity", "16MB", "-max-group", "8MB",
         )
         volumes = plan_volumes(machine)
@@ -61,7 +60,7 @@
         # a volume that is on no medium. Only the mount itself can say.
         machine.fail("mountpoint -q /mnt/lto")
         out = kura(
-            machine, "write", "-plan", PLAN, "-catalog", CATALOG,
+            machine, "write", "-workdir", WORKDIR,
             "-mount", "/mnt/lto", check=False,
         )
         assert_contains(out, "is not a mount point", "unmounted path")
@@ -73,7 +72,7 @@
         # The operator forgot to swap. The medium says volume one, the plan has
         # moved on to volume two, and that disagreement is the check.
         mount = load(machine, 1)
-        out = kura(machine, "write", "-plan", PLAN, "-catalog", CATALOG, "-mount", mount, check=False)
+        out = kura(machine, "write", "-workdir", WORKDIR, "-mount", mount, check=False)
         assert_contains(out, f"the drive holds volume {volumes[0]}", "wrong cartridge")
         assert_contains(out, f"expects {volumes[1]}", "wrong cartridge")
         unload(machine)
@@ -93,7 +92,7 @@
     with subtest("asking for a volume the plan does not contain is refused"):
         mount = load(machine, 1)
         out = kura(
-            machine, "write", "-plan", PLAN, "-catalog", CATALOG,
+            machine, "write", "-workdir", WORKDIR,
             "-mount", mount, "-volume", "LTO099", check=False,
         )
         assert_contains(out, "no volume", "unknown volume")
@@ -106,18 +105,18 @@
         blank(machine, 3)
         kura(
             machine, "plan",
-            "-root", STORAGE, "-catalog", FOREIGN, "-out", FOREIGN_PLAN,
+            "-root", STORAGE, "-workdir", FOREIGN,
             "-capacity", "16MB", "-max-group", "8MB", "-prefix", "FOR",
         )
         mount = load(machine, 3)
-        kura(machine, "write", "-plan", FOREIGN_PLAN, "-catalog", FOREIGN, "-mount", mount)
+        kura(machine, "write", "-workdir", FOREIGN, "-mount", mount)
         unload(machine)
 
         # Now offer that cartridge to the first archive. Its archive header is
         # checked before its volume header, so this is foreign rather than a
         # wrong cartridge — the operator has a different problem.
         mount = load(machine, 3)
-        out = kura(machine, "write", "-plan", PLAN, "-catalog", CATALOG, "-mount", mount, check=False)
+        out = kura(machine, "write", "-workdir", WORKDIR, "-mount", mount, check=False)
         assert_contains(out, "belongs to archive", "foreign volume")
         unload(machine)
 
@@ -128,7 +127,7 @@
 
     with subtest("re-running a finished plan does nothing rather than writing again"):
         mount = load(machine, 1)
-        out = kura(machine, "write", "-plan", PLAN, "-catalog", CATALOG, "-mount", mount)
+        out = kura(machine, "write", "-workdir", WORKDIR, "-mount", mount)
         assert_contains(out, "already been written", "exhausted plan")
         unload(machine)
 
@@ -137,7 +136,7 @@
         # repeated write has to recognise what it already placed. This is the
         # same path an interrupted write takes when it is run again.
         mount = load(machine, 1)
-        kura(machine, "write", "-plan", PLAN, "-catalog", CATALOG, "-mount", mount, "-volume", volumes[0])
+        kura(machine, "write", "-workdir", WORKDIR, "-mount", mount, "-volume", volumes[0])
         unload(machine)
         assert_contains(verify_volume(machine, 1), "Clean.", "verify after a repeated write")
 
@@ -147,7 +146,7 @@
         # meant, and it has to stop rather than scrub the wrong one.
         mount = load(machine, 1)
         status, out = kura_status(
-            machine, "verify", "-catalog", CATALOG, "-mount", mount,
+            machine, "verify", "-workdir", WORKDIR, "-mount", mount,
             "-volume", volumes[1], "-no-mark",
         )
         assert status != 0, f"verify accepted the wrong cartridge:\n{out}"
@@ -155,7 +154,7 @@
 
         machine.succeed("mkdir -p /tmp/wrong-restore")
         status, out = kura_status(
-            machine, "restore", "-catalog", CATALOG, "-mount", mount,
+            machine, "restore", "-workdir", WORKDIR, "-mount", mount,
             "-into", "/tmp/wrong-restore", "-volume", volumes[1],
         )
         assert status != 0, f"restore accepted the wrong cartridge:\n{out}"
@@ -169,7 +168,7 @@
         # the evidence of that, so verify names it and leaves it (DESIGN §8.1).
         mount = load(machine, 1)
         machine.succeed(f"mkdir -p {mount}/data/orphan && echo stray > {mount}/data/orphan/left-behind")
-        out = kura(machine, "verify", "-catalog", CATALOG, "-mount", mount, "-no-mark")
+        out = kura(machine, "verify", "-workdir", WORKDIR, "-mount", mount, "-no-mark")
         assert_contains(out, "no record accounts for", "unclaimed objects")
         assert_contains(out, "data/orphan/left-behind", "the unclaimed object is named")
         machine.succeed(f"test -e {mount}/data/orphan/left-behind")
@@ -182,7 +181,7 @@
         # between an obvious mistake and a confusing one.
         blank(machine, 2)
         mount = load(machine, 2)
-        status, out = kura_status(machine, "verify", "-catalog", CATALOG, "-mount", mount, "-no-mark")
+        status, out = kura_status(machine, "verify", "-workdir", WORKDIR, "-mount", mount, "-no-mark")
         assert status != 0, f"verify accepted a blank cartridge:\n{out}"
         assert_contains(out, "blank", "blank cartridge")
         unload(machine)

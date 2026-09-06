@@ -19,15 +19,15 @@ func runVerify(argv []string) {
 	argv, allowAnyDir := takeHiddenFlag(argv, hiddenAnyDir)
 	fs := flag.NewFlagSet("verify", flag.ExitOnError)
 	var (
-		catalogPath = fs.String("catalog", "", "catalog to check against and update (required)")
-		mount       = fs.String("mount", "", "where the loaded volume is mounted (required)")
-		volumeID    = fs.String("volume", "", "refuse to run unless the loaded volume is this one")
-		noMark      = fs.Bool("no-mark", false, "report failures without recording them in the catalog")
+		state    = registerState(fs)
+		mount    = fs.String("mount", "", "where the loaded volume is mounted (required)")
+		volumeID = fs.String("volume", "", "refuse to run unless the loaded volume is this one")
+		noMark   = fs.Bool("no-mark", false, "report failures without recording them in the catalog")
 	)
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, `kura verify - read one volume back and check it against its digests
 
-  kura verify -catalog catalog.jsonl.gz -mount /mnt/lto
+  kura verify -mount /mnt/lto
 
 Checks whichever volume is loaded: which one that is comes from the medium's own
 kura.volume.json, not from where it happens to be mounted. Pass -volume to make
@@ -48,13 +48,14 @@ Flags:
 	}
 	fs.Parse(argv)
 
-	if *catalogPath == "" || *mount == "" {
-		fmt.Fprintln(os.Stderr, "error: -catalog and -mount are both required")
+	if *mount == "" {
+		fmt.Fprintln(os.Stderr, "error: -mount is required")
 		fs.Usage()
 		os.Exit(2)
 	}
 
-	cat, err := catalog.Load(*catalogPath)
+	wd := state.open()
+	cat, err := catalog.Load(wd.Catalog())
 	if err != nil {
 		fatal(err)
 	}
@@ -75,7 +76,7 @@ Flags:
 	}
 
 	if !*noMark {
-		if err := catalog.Write(*catalogPath, cat.Header, cat.Records); err != nil {
+		if err := catalog.Write(wd.Catalog(), cat.Header, cat.Records); err != nil {
 			fatal(err)
 		}
 	}
@@ -120,17 +121,17 @@ func runRestore(argv []string) {
 	argv, allowAnyDir := takeHiddenFlag(argv, hiddenAnyDir)
 	fs := flag.NewFlagSet("restore", flag.ExitOnError)
 	var (
-		catalogPath = fs.String("catalog", "", "catalog to restore from (required)")
-		mount       = fs.String("mount", "", "where the loaded volume is mounted (required)")
-		volumeID    = fs.String("volume", "", "refuse to run unless the loaded volume is this one")
-		into        = fs.String("into", "", "directory to restore into (required)")
-		atGen       = fs.Int("at-gen", 0, "generation to reconstruct; default is the newest")
-		noVerify    = fs.Bool("no-verify", false, "skip digest checking as files are written")
+		state    = registerState(fs)
+		mount    = fs.String("mount", "", "where the loaded volume is mounted (required)")
+		volumeID = fs.String("volume", "", "refuse to run unless the loaded volume is this one")
+		into     = fs.String("into", "", "directory to restore into (required)")
+		atGen    = fs.Int("at-gen", 0, "generation to reconstruct; default is the newest")
+		noVerify = fs.Bool("no-verify", false, "skip digest checking as files are written")
 	)
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, `kura restore - write out what one volume holds
 
-  kura restore -catalog catalog.jsonl.gz -mount /mnt/lto -into /restore
+  kura restore -mount /mnt/lto -into /restore
 
 Restores whichever volume is loaded, identified from its own kura.volume.json
 rather than from where it is mounted; -volume makes that an assertion.
@@ -146,13 +147,13 @@ Flags:
 	}
 	fs.Parse(argv)
 
-	if *catalogPath == "" || *mount == "" || *into == "" {
-		fmt.Fprintln(os.Stderr, "error: -catalog, -mount and -into are all required")
+	if *mount == "" || *into == "" {
+		fmt.Fprintln(os.Stderr, "error: -mount and -into are both required")
 		fs.Usage()
 		os.Exit(2)
 	}
 
-	cat, err := catalog.Load(*catalogPath)
+	cat, err := catalog.Load(state.open().Catalog())
 	if err != nil {
 		fatal(err)
 	}
@@ -229,12 +230,12 @@ Flags:
 func runVolumes(argv []string) {
 	fs := flag.NewFlagSet("volumes", flag.ExitOnError)
 	var (
-		catalogPath = fs.String("catalog", "", "catalog to read")
-		overdue     = fs.String("overdue", "180d", "flag volumes not verified within this long; accepts 30d, 12h")
+		state   = registerState(fs)
+		overdue = fs.String("overdue", "180d", "flag volumes not verified within this long; accepts 30d, 12h")
 	)
 	fs.Parse(argv)
 
-	cat, err := catalog.Load(*catalogPath)
+	cat, err := catalog.Load(state.open().Catalog())
 	if err != nil {
 		fatal(err)
 	}
@@ -282,7 +283,7 @@ func runVolumes(argv []string) {
 		// A full scrub cannot be one command that runs for days, so the useful
 		// question is which volume to put in the drive next (DESIGN §8).
 		fmt.Printf("\n  Most overdue first: %v\n", due)
-		fmt.Printf("  kura verify -catalog ... -mount <where you loaded %s>\n", due[0])
+		fmt.Printf("  kura verify -mount <where you loaded %s>\n", due[0])
 	}
 }
 

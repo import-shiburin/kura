@@ -29,7 +29,7 @@
         make_source(machine, spec="tiny=200,small=60,medium=3", seed=31)
         kura(
             machine, "plan",
-            "-root", STORAGE, "-catalog", CATALOG, "-out", PLAN,
+            "-root", STORAGE, "-workdir", WORKDIR,
             "-capacity", "64MB", "-max-group", "16MB",
         )
         volumes = plan_volumes(machine)
@@ -55,7 +55,7 @@
 
     with subtest("verify catches it and names the one file it cost"):
         mount = load(machine, 1)
-        status, out = kura_status(machine, "verify", "-catalog", CATALOG, "-mount", mount)
+        status, out = kura_status(machine, "verify", "-workdir", WORKDIR, "-mount", mount)
         unload(machine)
 
         assert status != 0, f"verify passed over a corrupted container:\n{out}"
@@ -71,13 +71,13 @@
         assert len(failures) == 1, f"expected one damaged file, got {len(failures)}:\n" + "\n".join(failures)
 
     with subtest("the inventory reports the loss against the volume that holds it"):
-        inventory = kura(machine, "volumes", "-catalog", CATALOG)
+        inventory = kura(machine, "volumes", "-workdir", WORKDIR)
         assert_contains(inventory, volumes[0], "inventory")
         machine.log(inventory)
 
     with subtest("a restore of the damaged volume refuses to look complete"):
         status, out = kura_status(
-            machine, "restore", "-catalog", CATALOG,
+            machine, "restore", "-workdir", WORKDIR,
             "-mount", load(machine, 1), "-into", "/tmp/partial",
         )
         unload(machine)
@@ -91,11 +91,11 @@
         # the first cycle's IDs.
         kura(
             machine, "plan",
-            "-root", STORAGE, "-catalog", CATALOG, "-out", PLAN,
+            "-root", STORAGE, "-workdir", WORKDIR,
             "-capacity", "64MB", "-max-group", "16MB",
             "-start", len(volumes) + 1,
         )
-        plan_text = machine.succeed(f"cat {PLAN}")
+        plan_text = machine.succeed(f"cat {plan_path()}")
         assert damaged in plan_text, f"generation 2 does not re-source {damaged}"
 
     with subtest("writing that generation restores the file to the archive"):

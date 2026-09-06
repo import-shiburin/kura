@@ -63,15 +63,30 @@
         assert_contains(kura(machine, "verify", check=False), "required", "verify with no flags")
         assert_contains(kura(machine, "restore", check=False), "required", "restore with no flags")
 
-    with subtest("restoring from a catalog that holds nothing says so"):
-        # A missing catalog loads as an empty one rather than failing, so this
-        # is the first run's most likely mistake: the operator restores before
-        # anything has been written. It has to name the reason, not the file.
+    with subtest("restoring from an archive that holds nothing says so"):
+        # The first run's most likely mistake: the operator restores before
+        # anything has been written. A workdir exists — plan made one — but its
+        # catalog does not, and a missing catalog loads as an empty one rather
+        # than failing. The message has to name the reason, not a file.
+        empty = "/var/lib/kura/planned-only"
+        machine.succeed(f"mkdir -p {empty} && echo '{{}}' > {empty}/plan.json")
         out = kura(
-            machine, "restore", "-catalog", "/var/lib/kura/nothing-here.jsonl.gz",
+            machine, "restore", "-workdir", empty,
             "-mount", "/tmp/no-such-mount", "-into", "/tmp/nowhere", check=False,
         )
         assert_contains(out, "nothing to restore", "empty catalog")
+
+    with subtest("a workdir that was never created is a different error"):
+        # Distinct from the above on purpose. "Nothing written yet" and "you
+        # pointed me at the wrong place" send the operator to different places,
+        # and the old interface could not tell them apart at all: a mistyped
+        # -catalog path loaded as an empty catalog and reported an empty
+        # archive.
+        out = kura(
+            machine, "restore", "-workdir", "/var/lib/kura/nothing-here",
+            "-mount", "/tmp/no-such-mount", "-into", "/tmp/nowhere", check=False,
+        )
+        assert_contains(out, "no workdir", "absent workdir")
 
     with subtest("per-command help lists that command's flags"):
         for cmd in ["plan", "write", "verify", "restore", "volumes", "history", "at-gen"]:
@@ -93,7 +108,7 @@
 
         out = kura(
             machine, "plan",
-            "-root", STORAGE, "-catalog", CATALOG, "-out", PLAN,
+            "-root", STORAGE, "-workdir", WORKDIR,
             "-lists", "/tmp/lists",
             "-exclude-from", "/tmp/ex.txt",
             "-hash", "all",
@@ -111,17 +126,17 @@
 
     with subtest("bad values for plan's enumerated flags are refused"):
         for flag, value in [("-hash", "sideways"), ("-match", "sideways")]:
-            out = kura(machine, "plan", "-root", STORAGE, "-catalog", CATALOG,
+            out = kura(machine, "plan", "-root", STORAGE, "-workdir", WORKDIR,
                        "-out", "-", flag, value, check=False)
             assert_contains(out, "must be", f"{flag} {value}")
 
     with subtest("plan with no -root is refused"):
-        out = kura(machine, "plan", "-catalog", CATALOG, "-out", "-", check=False)
+        out = kura(machine, "plan", "-workdir", WORKDIR, "-out", "-", check=False)
         assert_contains(out, "at least one -root is required", "missing -root")
 
     with subtest("at-gen wants exactly one generation"):
         for args in ([], ["1", "2"]):
-            status, out = kura_status(machine, "at-gen", "-catalog", CATALOG, *args)
+            status, out = kura_status(machine, "at-gen", "-workdir", WORKDIR, *args)
             assert status != 0, f"at-gen accepted {args!r}:\n{out}"
 
     with subtest("volumes flags an overdue verification"):
@@ -131,17 +146,17 @@
 
         # A zero window makes a volume verified a moment ago already overdue,
         # which is the only way to reach that branch without waiting months.
-        out = kura(machine, "volumes", "-catalog", CATALOG, "-overdue", "0s")
+        out = kura(machine, "volumes", "-workdir", WORKDIR, "-overdue", "0s")
         assert_contains(out, "overdue", "overdue window")
         assert_contains(out, "Most overdue first", "overdue advice")
 
-        status, out = kura_status(machine, "volumes", "-catalog", CATALOG, "-overdue", "weekly")
+        status, out = kura_status(machine, "volumes", "-workdir", WORKDIR, "-overdue", "weekly")
         assert status != 0, f"an unparseable window was accepted:\n{out}"
 
     with subtest("a dry run touches nothing"):
         blank(machine, 2)
         mount = load(machine, 2)
-        kura(machine, "write", "-plan", PLAN, "-catalog", CATALOG, "-mount", mount,
+        kura(machine, "write", "-workdir", WORKDIR, "-mount", mount,
              "-volume", volumes[0], "-dry-run", "-quiet")
         # Counted the way the backend counts: files only, minus its own staging
         # directory. A real ext4 cartridge also carries an empty lost+found from

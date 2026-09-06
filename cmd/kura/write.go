@@ -6,7 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
+	"strings"
 	"time"
 
 	"kura/internal/archive"
@@ -14,19 +14,20 @@ import (
 	"kura/internal/plan"
 	"kura/internal/volume"
 	"kura/internal/volume/filevol"
+	"kura/internal/workdir"
 )
 
 func runWrite(argv []string) {
 	argv, allowAnyDir := takeHiddenFlag(argv, hiddenAnyDir)
 	fs := flag.NewFlagSet("write", flag.ExitOnError)
 	var (
-		planPath    = fs.String("plan", "plan.json", "plan to execute")
-		catalogPath = fs.String("catalog", "", "catalog to read and update (required)")
-		mount       = fs.String("mount", "", "where the loaded volume is mounted (required)")
-		volumeID    = fs.String("volume", "", "which volume of the plan to write; default is the first one not yet written")
-		copies      = fs.Int("catalog-copies", archive.DefaultCatalogCopies, "how many times to write the catalog onto the volume")
-		dryRun      = fs.Bool("dry-run", false, "read and digest everything, write nothing")
-		quiet       = fs.Bool("quiet", false, "suppress per-object progress")
+		state    = registerState(fs)
+		planPath = fs.String("plan", "", "plan to execute; default is the current one in the workdir")
+		mount    = fs.String("mount", "", "where the loaded volume is mounted (required)")
+		volumeID = fs.String("volume", "", "which volume of the plan to write; default is the first one not yet written")
+		copies   = fs.Int("catalog-copies", archive.DefaultCatalogCopies, "how many times to write the catalog onto the volume")
+		dryRun   = fs.Bool("dry-run", false, "read and digest everything, write nothing")
+		quiet    = fs.Bool("quiet", false, "suppress per-object progress")
 	)
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, `kura write - place one volume's share of a plan
@@ -35,13 +36,19 @@ Writes exactly one volume and exits. Run it again, with the next cartridge
 loaded, for the next one: state lives in the catalog, so the drive can be
 powered off for weeks in between.
 
-  kura write -plan plan.json -catalog catalog.jsonl.gz -mount /mnt/lto
+  kura write -mount /mnt/lto
 
 -mount is where the medium is mounted, and nothing more: a drive is one fixed
 path and the cartridge in it is whichever one you pushed in. Which volume that
 is comes from the medium's own kura.volume.json, so loading the wrong cartridge
 is refused rather than guessed at. A blank cartridge has no identity yet and
 becomes the volume the plan asked for.
+
+There is nothing to say about the catalog or the plan: both live in the
+archive's workdir, which kura plan created and which the flagless form finds on
+its own. -workdir or -archive picks between several archives on one host, and
+a plan named with -plan is still checked against the archive and the cycle it
+belongs to rather than taken on trust.
 
 What goes in which container was settled by kura plan and is recorded in the
 plan file, so a write that is interrupted and re-run places exactly the same
@@ -53,18 +60,29 @@ Flags:
 	}
 	fs.Parse(argv)
 
-	if *catalogPath == "" || *mount == "" {
-		fmt.Fprintln(os.Stderr, "error: -catalog and -mount are both required")
+	if *mount == "" {
+		fmt.Fprintln(os.Stderr, "error: -mount is required")
 		fs.Usage()
 		os.Exit(2)
 	}
 
-	p, err := loadPlan(*planPath)
+	wd := state.open()
+	from := *planPath
+	if from == "" {
+		from = wd.Plan()
+	}
+	p, err := loadPlan(from)
 	if err != nil {
 		fatal(err)
 	}
-	cat, err := catalog.Load(*catalogPath)
+	if note := planElsewhere(wd, p); note != "" {
+		fmt.Fprintln(os.Stderr, note)
+	}
+	cat, err := catalog.Load(wd.Catalog())
 	if err != nil {
+		fatal(err)
+	}
+	if err := checkPlanCatalog(p, cat, wd.Path); err != nil {
 		fatal(err)
 	}
 
@@ -75,7 +93,7 @@ Flags:
 		// volumes at all, and it is still a generation.
 		if n := cat.Tombstone(p.Deleted, p.Generation); n > 0 && !*dryRun {
 			cat.Header.Generation = max(cat.Header.Generation, p.Generation)
-			if err := catalog.Write(*catalogPath, cat.Header, cat.Records); err != nil {
+			if err := catalog.Write(wd.Catalog(), cat.Header, cat.Records); err != nil {
 				fatal(err)
 			}
 			fmt.Printf("recorded %s as deleted at generation %d\n", count(int64(n), "path"), p.Generation)
@@ -107,7 +125,7 @@ Flags:
 	// the check that used to sit at this point compared the plan against the
 	// mount point's name, so it only ever agreed with itself.
 
-	if err := ensureArchiveID(ctx, cat, vol, *catalogPath, *dryRun); err != nil {
+	if err := ensureArchiveID(ctx, cat, vol, p, wd.Catalog(), *dryRun); err != nil {
 		fatal(err)
 	}
 
@@ -122,7 +140,7 @@ Flags:
 		Archive:       cat.Header.Archive,
 		Generation:    p.Generation,
 		CatalogCopies: *copies,
-		StageDir:      filepath.Dir(*catalogPath),
+		StageDir:      wd.Stage(),
 		DryRun:        *dryRun,
 		OnObject: func(name string, size int64) {
 			written += size
@@ -151,13 +169,13 @@ Flags:
 		// The volume already carries this catalog; the local copy is a cache of
 		// what the medium says.
 		cat.Header.Generation = max(cat.Header.Generation, p.Generation)
-		recordGeneration(cat, p.Generation, pv.ID)
-		if err := catalog.Write(*catalogPath, cat.Header, cat.Records); err != nil {
+		recordGeneration(cat, p.Generation, pv.ID, p.ID)
+		if err := catalog.Write(wd.Catalog(), cat.Header, cat.Records); err != nil {
 			fatal(err)
 		}
 	}
 
-	reportWrite(res, elapsed, *dryRun, *catalogPath)
+	reportWrite(res, elapsed, *dryRun, wd.Catalog())
 	if tombstoned > 0 {
 		fmt.Printf("  %s recorded as deleted at generation %d; the bytes stay on the volumes that hold them\n",
 			count(int64(tombstoned), "path"), p.Generation)
@@ -165,6 +183,74 @@ Flags:
 	if len(res.Problems) > 0 {
 		os.Exit(1)
 	}
+}
+
+// planElsewhere reports the announcement owed when a plan was made somewhere
+// other than the workdir being written to.
+//
+// Reachable only through -plan: a plan taken from the workdir names the workdir
+// it came from. It is said out loud rather than passed over because the
+// workdir is what the command mutates and the pairing check below is not
+// total — a plan made before its archive had an ID has nothing to compare.
+func planElsewhere(wd workdir.Dir, p *plan.Plan) string {
+	if p.Workdir == "" || p.Workdir == wd.Path {
+		return ""
+	}
+	return fmt.Sprintf("writing into %s; this plan was made in %s", wd.Path, p.Workdir)
+}
+
+// checkPlanCatalog refuses a plan and a catalog that do not belong together.
+//
+// They were never independent arguments. A plan is a delta against one
+// catalog: its volume IDs, its generation and its deletion list mean nothing
+// beside a different one. A mismatched pair used to be accepted in silence and
+// the result was unrecoverable — the plan's volume ID was stamped onto a blank
+// cartridge next to the *other* archive's ID, the other catalog recorded files
+// on a volume belonging to neither archive, and `verify` then called that
+// cartridge Clean, because after the fact the whole arrangement is
+// self-consistent. Nothing downstream could have caught it, which is why the
+// check has to be here, before the first object is placed.
+//
+// Deliberately not a fingerprint of the catalog file. `write` rewrites the
+// catalog after every volume, so volume 2 of a plan legitimately meets a
+// different file than the plan was built from. What has to match is the
+// lineage — the archive — and the cycle — the plan.
+func checkPlanCatalog(p *plan.Plan, cat *catalog.Catalog, path string) error {
+	if p.Archive != "" && cat.Header.Archive != "" && p.Archive != cat.Header.Archive {
+		return fmt.Errorf("this plan was made against archive %s, but %s is archive %s; "+
+			"they are not the same archive, so run kura plan against the catalog you mean to write",
+			p.Archive, path, cat.Header.Archive)
+	}
+
+	// A plan made against a catalog that had no archive ID yet carries none to
+	// compare, and that window — the first cycle of an archive — is exactly
+	// where the two are easiest to mix up. The cycle closes it: whichever plan
+	// wrote the first volume of this generation is named in the timeline, and
+	// the rest of the cycle has to be that same plan. An interrupted first
+	// write leaves no timeline entry, so resuming one is not caught here.
+	//
+	// Either side may be missing, and a missing one is a check that cannot run
+	// rather than one that fails: a plan file from a build that recorded no ID
+	// offers no evidence about which cycle it belongs to, and refusing it would
+	// strand a cycle halfway through on nothing but a version difference.
+	if p.ID == "" {
+		return nil
+	}
+	for _, g := range cat.Header.Timeline {
+		if g.Gen != p.Generation || g.Plan == "" || g.Plan == p.ID {
+			continue
+		}
+		// Naming what the other plan already wrote is what makes the error an
+		// instruction: it says which cartridge's plan to go and find.
+		wrote := "that generation"
+		if len(g.Volumes) > 0 {
+			wrote = strings.Join(g.Volumes, ", ")
+		}
+		return fmt.Errorf("generation %d of %s was started by a different plan; "+
+			"finish it with the plan that wrote %s, or run kura plan again for a new generation",
+			p.Generation, path, wrote)
+	}
+	return nil
 }
 
 // ensureArchiveID settles which archive this catalog describes, and persists
@@ -184,7 +270,7 @@ Flags:
 // volume's is adopted rather than a second identity being minted for an archive
 // that already has one — the medium is the authority (DESIGN §11), so a catalog
 // lost entirely can still be repaired from any cartridge.
-func ensureArchiveID(ctx context.Context, cat *catalog.Catalog, vol volume.Volume, catalogPath string, dryRun bool) error {
+func ensureArchiveID(ctx context.Context, cat *catalog.Catalog, vol volume.Volume, p *plan.Plan, catalogPath string, dryRun bool) error {
 	if cat.Header.Archive != "" {
 		return nil
 	}
@@ -197,6 +283,15 @@ func ensureArchiveID(ctx context.Context, cat *catalog.Catalog, vol volume.Volum
 	case onMedium != "":
 		cat.Header.Archive = onMedium
 		fmt.Fprintf(os.Stderr, "adopting archive %s from the loaded volume; the catalog did not name one\n", onMedium)
+	case p.Archive != "":
+		// Third in line, and the order is the argument. The plan read this off
+		// the catalog when it was made, so it is hearsay where the medium is a
+		// primary source — but it is still evidence that this archive exists,
+		// and minting a fresh ID for an archive that already has one is the
+		// failure this whole function was written to prevent. Reachable when
+		// the catalog was lost and the cartridge in the drive is blank.
+		cat.Header.Archive = p.Archive
+		fmt.Fprintf(os.Stderr, "adopting archive %s from the plan; the catalog did not name one\n", p.Archive)
 	default:
 		id, err := archive.NewArchiveID()
 		if err != nil {
@@ -243,12 +338,19 @@ func alreadyWritten(cat *catalog.Catalog, id string, gen int) bool {
 }
 
 // recordGeneration keeps the timeline current, so history and a date-based
-// restore have something to read.
-func recordGeneration(cat *catalog.Catalog, gen int, volumeID string) {
+// restore have something to read, and names the plan that started the cycle so
+// checkPlanCatalog can hold the rest of it to the same one.
+func recordGeneration(cat *catalog.Catalog, gen int, volumeID, planID string) {
 	for i := range cat.Header.Timeline {
 		g := &cat.Header.Timeline[i]
 		if g.Gen != gen {
 			continue
+		}
+		// Backfilled rather than left alone, so a generation begun by a build
+		// that did not record plans starts being checked at the next volume
+		// instead of staying unchecked for the life of the cycle.
+		if g.Plan == "" {
+			g.Plan = planID
 		}
 		for _, v := range g.Volumes {
 			if v == volumeID {
@@ -262,6 +364,7 @@ func recordGeneration(cat *catalog.Catalog, gen int, volumeID string) {
 		Gen:     gen,
 		Written: time.Now().UTC().Format(time.RFC3339),
 		Volumes: []string{volumeID},
+		Plan:    planID,
 	})
 }
 

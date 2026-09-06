@@ -104,6 +104,18 @@ type Plan struct {
 	Generation int    `json:"generation"`
 	Created    string `json:"created"`
 
+	// Workdir, Archive and ID record which archive's state this plan was
+	// computed against. A plan is a delta, not a standalone description: its
+	// volume IDs, its generation and its deletion list only mean anything
+	// beside the catalog they were derived from, so a writer handed this plan
+	// from somewhere else can tell that it does not belong.
+	//
+	// All three are optional, so a plan written by an older build still loads.
+	// An absent field is a check that does not run, never a failed one.
+	Workdir string `json:"workdir,omitempty"` // absolute path to the archive's local state
+	Archive string `json:"archive,omitempty"` // empty for a workdir that has never been written to
+	ID      string `json:"id,omitempty"`      // this plan, distinct from every other
+
 	Volumes []*Volume `json:"volumes"`
 
 	// Deleted is the paths that stopped existing in this generation.

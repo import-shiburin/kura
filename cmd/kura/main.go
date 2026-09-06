@@ -10,6 +10,8 @@ package main
 import (
 	"fmt"
 	"os"
+
+	"kura/internal/workdir"
 )
 
 // Version is stamped at build time with -ldflags "-X main.Version=...".
@@ -67,9 +69,15 @@ Commands:
 Run "kura <command> -h" for a command's flags.
 
 A cycle is: plan once, then write once per volume, swapping media in between.
-Every command handles one volume and exits, with state in the catalog, so the
-drive can be powered off for weeks between cartridges.
-`, Version)
+
+  kura plan  -root /storage
+  kura write -mount /mnt/lto      # once per cartridge, unchanged each time
+
+Every command handles one volume and exits, with state in the archive's workdir
+under %s, so the drive can be powered off for weeks between
+cartridges. Nothing there is yours to name: -workdir and -archive exist only to
+pick between archives when a host holds more than one.
+`, Version, workdir.Root())
 }
 
 func fatal(err error) {

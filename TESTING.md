@@ -282,7 +282,7 @@ helper in scope.
 
 `cmd/kura` is the whole argument: it is argument handling, refusals and
 operator output, nearly all of it behind an `os.Exit` that no in-process test
-survives. Seven VM scenarios took it from a quarter covered to seven eighths.
+survives. Eight VM scenarios took it from a quarter covered to seven eighths.
 
 The floors in `.covcheck.json` are the right-hand column, rounded down. 332
 statements in 274 blocks remain — `covcheck uncovered` lists them, and after

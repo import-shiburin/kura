@@ -26,6 +26,7 @@
     "kura/internal/plan": 94.1,
     "kura/internal/scan": 91,
     "kura/internal/volume": 100,
-    "kura/internal/volume/filevol": 81.1
+    "kura/internal/volume/filevol": 81.1,
+    "kura/internal/workdir": 89
   }
 }

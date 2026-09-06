@@ -96,14 +96,15 @@ restore.
 | | |
 |---|---|
 | `internal/volume` + `filevol` | the backend seam and directory-as-volume — 16 tests |
-| `internal/catalog` | records, history queries, `Lost`, `Tombstone`, per-object cipher — 25 tests |
-| `internal/scan` | walk, exclusions, hashing, `Diff` — 38 tests |
-| `internal/plan` | `Group`, `Layout`, `Pack` — 34 tests |
+| `internal/workdir` | one directory per archive: layout, resolution, `-archive` — 15 tests |
+| `internal/catalog` | records, history queries, `Lost`, `Tombstone`, per-object cipher, cheap header read — 31 tests |
+| `internal/scan` | walk, exclusions, hashing, `Diff` — 31 tests |
+| `internal/plan` | `Group`, `Layout`, `Pack` — 29 tests |
 | `internal/archive` | `Write`, `Verify`, `Restore`, containers, both headers, volume identity — 34 tests |
-| `cmd/kura` | `plan`, `write`, `verify`, `restore`, `volumes`, `history`, `at-gen` — 10 tests |
-| `nix/e2e/scenarios` | seven NixOS VMs: real cartridges, swaps, ENOSPC, power cuts — see [TESTING.md](TESTING.md) |
+| `cmd/kura` | `plan`, `write`, `verify`, `restore`, `volumes`, `history`, `at-gen`, plan/catalog pairing — 29 tests |
+| `nix/e2e/scenarios` | eight NixOS VMs: real cartridges, swaps, ENOSPC, power cuts — see [TESTING.md](TESTING.md) |
 
-157 tests. Exercised against a real 356-file tree across six volumes: written,
+185 tests. Exercised against a real 356-file tree across six volumes: written,
 verified, restored byte-identical, then a flipped byte inside a container caught
 and attributed to the one file it damaged, marked lost, and re-sourced by the
 next plan.
@@ -111,10 +112,30 @@ next plan.
 **How a cycle goes.**
 
 ```sh
-kura plan   -root /storage -catalog catalog.jsonl.gz -out plan.json
-kura write  -plan plan.json -catalog catalog.jsonl.gz -mount /mnt/lto   # repeat per cartridge
-kura verify -catalog catalog.jsonl.gz -mount /mnt/lto
+kura plan   -root /storage
+kura write  -mount /mnt/lto     # repeat per cartridge, unchanged each time
+kura verify -mount /mnt/lto
 ```
+
+**No command names kura's own files.** Each archive owns a workdir —
+`/var/lib/kura/<archive-id>/`, or `$KURA_HOME` — holding the catalog, the
+current plan and the container staging area. `plan` creates it; everything
+after finds it. `-workdir` or `-archive` picks between several archives on one
+host, and `-archive` is an assertion rather than a lookup, the way `-volume` is
+for `verify`. DESIGN §10.3.
+
+Two consequences of that, both load-bearing:
+
+- **`plan` mints the archive ID**, because the workdir is named by it and has to
+  exist before any cartridge does. The medium is still the authority —
+  `ensureArchiveID` prefers the loaded volume and takes the plan's ID only when
+  the catalog has none.
+- **`plan` refuses to replace a part-written cycle** (`-force` overrides). The
+  plan file is kura's now, so overwriting one would strand the cartridges
+  already written in a plan nothing can finish.
+
+A plan carried in with `-plan` is still checked against the archive and the
+cycle it belongs to, and refused before the first object. DESIGN §10.2.
 
 `-mount` is where the medium is mounted and nothing more — a drive is one fixed
 path, and the cartridge in it is whichever one the operator pushed in. Which
@@ -198,6 +219,16 @@ containers/gNNNN/<item>.partNNN.tar   everything below the threshold
   the truth or a volume the plan said would fit will not.
 - **Overwriting an object name is an error**, not a replace. On media that never
   reclaims space, a repeated name means the catalog lost track of what it stored.
+- **A plan and a catalog are one pair.** A plan is a delta against one catalog,
+  so `write` checks the two against each other before placing an object —
+  nothing after that point can. Crossing them used to stamp one archive's ID
+  and another's volume ID onto the same cartridge, and `verify` then called it
+  Clean, because after the fact it is self-consistent. The workdir now makes
+  the pair structural, and `-plan` is the one route left to crossing it. Do not
+  check by fingerprinting the catalog file: `write` rewrites it after every
+  volume, so volume 2 of a plan legitimately meets a different file than the
+  plan was built from. Match the lineage (archive) and the cycle (plan ID).
+  DESIGN §10.2, §10.3.
 - **Nothing mutable goes at the root of a volume.** LTFS does not modify a file;
   it appends the new bytes and abandons the old blocks. So a header field that
   changes costs a fresh copy every cycle and strands the last one. The root

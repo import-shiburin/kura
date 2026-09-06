@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -592,5 +593,101 @@ func TestATombstonedPathThatReturnsIsNotFoundLive(t *testing.T) {
 	r, ok := cat.Lookup("/storage/x")
 	if !ok || r.Size != 99 {
 		t.Errorf("re-adding the path should make it live again at the new version, got %+v", r)
+	}
+}
+
+// TestReadHeaderCostsOneLine is why ReadHeader exists rather than Load: every
+// command has to resolve which archive a workdir holds before it does anything
+// else, and Load pulls in 1.16 GB of heap and six seconds at the real
+// archive's 1.66 M paths to answer it.
+func TestReadHeaderCostsOneLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "catalog.jsonl.gz")
+	want := Header{Format: Format, Archive: "0123456789abcdef", Generation: 7}
+	recs := []*Record{
+		{Path: "/a", Size: 1, Gen: 7},
+		{Path: "/b", Size: 2, Gen: 7},
+	}
+	if err := Write(path, want, recs); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ReadHeader(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Archive != want.Archive || got.Generation != want.Generation {
+		t.Errorf("read back %+v, wrote %+v", got, want)
+	}
+}
+
+// TestReadHeaderSaysWhenThereIsNoHeader. Load treats the header as optional and
+// answers with a zero value, which a caller asking "which archive is this?"
+// cannot tell apart from an archive with no ID. ReadHeader has to be explicit
+// or a headerless catalog would silently resolve as anonymous.
+func TestReadHeaderSaysWhenThereIsNoHeader(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "headerless.jsonl")
+	if err := os.WriteFile(path, []byte(`{"path":"/a","size":1}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ReadHeader(path); !errors.Is(err, ErrNoHeader) {
+		t.Fatalf("a headerless catalog gave %v, wanted ErrNoHeader", err)
+	}
+}
+
+// TestReadHeaderOnAnEmptyFile: a catalog that exists but holds nothing is what
+// an interrupted first write can leave, and it has no identity to report.
+func TestReadHeaderOnAnEmptyFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "empty.jsonl")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ReadHeader(path); !errors.Is(err, ErrNoHeader) {
+		t.Fatalf("an empty catalog gave %v, wanted ErrNoHeader", err)
+	}
+}
+
+// TestReadHeaderOnAMissingFile hands the error back rather than reporting an
+// anonymous archive. Load treats a missing catalog as an empty one — that is
+// the first generation — but a caller resolving identity has to know the
+// difference between "no archive here" and "nothing written yet".
+func TestReadHeaderOnAMissingFile(t *testing.T) {
+	_, err := ReadHeader(filepath.Join(t.TempDir(), "absent.jsonl.gz"))
+	if !os.IsNotExist(err) {
+		t.Fatalf("a missing catalog gave %v, wanted a not-exist error", err)
+	}
+}
+
+// TestReadHeaderOnCorruptGzip. The identity read happens before anything else,
+// so it is the first thing to meet a damaged local catalog, and saying "gzip"
+// points at the file rather than at the archive.
+func TestReadHeaderOnCorruptGzip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "truncated.jsonl.gz")
+	if err := os.WriteFile(path, []byte("not gzip at all"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ReadHeader(path)
+	if err == nil || !strings.Contains(err.Error(), "gzip") {
+		t.Fatalf("a corrupt gzip catalog gave %v, wanted a gzip error", err)
+	}
+}
+
+// TestReadHeaderOnAMalformedHeader: the line looks like a header — it carries a
+// _format — but does not parse. Reporting that as "no header" would send the
+// operator looking for a missing line rather than a broken one.
+func TestReadHeaderOnAMalformedHeader(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bad.jsonl")
+	if err := os.WriteFile(path, []byte(`{"_format":"kura-catalog/1","timeline":7}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ReadHeader(path)
+	if err == nil || errors.Is(err, ErrNoHeader) {
+		t.Fatalf("a malformed header gave %v, wanted a parse error", err)
+	}
+	if !strings.Contains(err.Error(), "catalog header") {
+		t.Errorf("the error should name what failed to parse: %v", err)
 	}
 }

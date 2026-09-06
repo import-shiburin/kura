@@ -37,7 +37,7 @@
         machine.succeed(f"cp -a {STORAGE} {GEN1_COPY}")
         kura(
             machine, "plan",
-            "-root", STORAGE, "-catalog", CATALOG, "-out", PLAN,
+            "-root", STORAGE, "-workdir", WORKDIR,
             "-capacity", "48MB", "-max-group", "16MB",
         )
         gen1 = plan_volumes(machine)
@@ -49,7 +49,7 @@
     with subtest("re-planning an unchanged tree finds nothing to write"):
         out = kura(
             machine, "plan",
-            "-root", STORAGE, "-catalog", CATALOG, "-out", "-",
+            "-root", STORAGE, "-workdir", WORKDIR, "-out", "-",
             "-capacity", "48MB", "-max-group", "16MB",
             "-start", len(gen1) + 1,
         )
@@ -68,7 +68,7 @@
 
         out = kura(
             machine, "plan",
-            "-root", STORAGE, "-catalog", CATALOG, "-out", "-",
+            "-root", STORAGE, "-workdir", WORKDIR, "-out", "-",
             "-capacity", "48MB", "-max-group", "16MB",
             "-start", len(gen1) + 1,
         )
@@ -86,7 +86,7 @@
 
         out = kura(
             machine, "plan",
-            "-root", STORAGE, "-catalog", CATALOG, "-out", PLAN,
+            "-root", STORAGE, "-workdir", WORKDIR,
             "-capacity", "48MB", "-max-group", "16MB",
             "-start", len(gen1) + 1,
         )
@@ -105,7 +105,7 @@
             slot += 1
 
     with subtest("history records both generations"):
-        out = kura(machine, "history", "-catalog", CATALOG)
+        out = kura(machine, "history", "-workdir", WORKDIR)
         machine.log(out)
         assert_contains(out, "GEN", "history header")
 
@@ -117,8 +117,8 @@
         # assertion here is on the counts. That a *particular* file came back
         # with its old bytes is proved by the restore comparison below, which
         # is the stronger check anyway.
-        old = kura(machine, "at-gen", "-catalog", CATALOG, "1")
-        new = kura(machine, "at-gen", "-catalog", CATALOG, "2")
+        old = kura(machine, "at-gen", "-workdir", WORKDIR, "1")
+        new = kura(machine, "at-gen", "-workdir", WORKDIR, "2")
         n_old = state_file_count(old)
         n_new = state_file_count(new)
 

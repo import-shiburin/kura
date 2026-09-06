@@ -15,6 +15,7 @@ import (
 	"kura/internal/catalog"
 	"kura/internal/plan"
 	"kura/internal/scan"
+	"kura/internal/workdir"
 )
 
 type stringList []string
@@ -28,7 +29,7 @@ func runPlan(argv []string) {
 		roots       stringList
 		excludeFrom stringList
 		excludeVCS  = fs.Bool("exclude-vcs", true, "skip version-control metadata")
-		catalogPath = fs.String("catalog", "", "catalog of what is already written (JSONL, optionally .gz; absent means first generation)")
+		state       = registerState(fs)
 		capacityStr = fs.String("capacity", "2.5TB", "usable capacity of a blank volume (LTO-6 native is 2.5TB)")
 		headroomStr = fs.String("headroom", "1%", "space held back on every volume; accepts a size or a percentage")
 		maxGroupStr = fs.String("max-group", "200GB", "largest subtree kept together on one volume")
@@ -41,7 +42,8 @@ func runPlan(argv []string) {
 		ignoreInode = fs.Bool("ignore-inode", false, "do not treat an inode change as reason to verify a file")
 		prefix      = fs.String("prefix", "LTO", "volume ID prefix")
 		startIndex  = fs.Int("start", 1, "first number for newly allocated volumes")
-		outPath     = fs.String("out", "plan.json", "where to write the machine-readable plan; - for none")
+		outPath     = fs.String("out", "", "extra copy of the machine-readable plan; - to write none at all")
+		force       = fs.Bool("force", false, "replace the workdir's plan even when its cycle is unfinished")
 		listsDir    = fs.String("lists", "", "directory to write per-volume file lists into")
 		topDepth    = fs.Int("top-depth", 2, "path depth for the largest-directories report")
 		copies      = fs.Int("catalog-copies", archive.DefaultCatalogCopies, "catalog copies each volume will carry; only used to reserve room for them")
@@ -55,19 +57,22 @@ func runPlan(argv []string) {
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, `kura plan - work out which files go on which volume
 
-Read-only. Scans the roots, compares against the catalog of what is already
-written, and bin-packs only the difference into volume-sized sets. Touches no
-drive and writes nothing outside -out and -lists.
+Touches no drive. Scans the roots, compares against what the archive already
+holds, and bin-packs only the difference into volume-sized sets. The plan it
+produces is left in the workdir, where kura write picks it up.
 
-First run (no catalog yet), sizing the baseline:
+  kura plan -root /storage -exclude-from media.exclude -allow-split
+
+The first run has no archive to compare against and creates one: %s/<archive>,
+holding that archive's catalog and plans and nothing an operator has to name.
+Later runs find it again on their own, and -workdir or -archive picks between
+several on one host.
+
+Sizing a baseline, before committing any media:
   kura plan -root /storage -exclude-from media.exclude -hash=all -lists ./lists
 
-Later runs, against the catalog the writer maintains:
-  kura plan -root /storage -exclude-from media.exclude \
-            -catalog catalog.jsonl.gz -allow-split
-
 Flags:
-`)
+`, workdir.Root())
 		fs.PrintDefaults()
 	}
 	fs.Parse(argv)
@@ -138,6 +143,24 @@ Flags:
 	for i, r := range parsed {
 		scanning[i] = r.Scan
 	}
+	// The last thing before the walk, and the first thing that touches disk.
+	// Every argument has been checked by now, so a bad flag does not leave a
+	// workdir behind; and a cold scan of the real archive is 35 minutes, which
+	// is a long time to wait to be told the cycle in progress is not finished.
+	wd := state.create()
+	cat, err := catalog.Load(wd.Catalog())
+	if err != nil {
+		fatal(err)
+	}
+	if prev, left := unfinishedCycle(wd, cat); prev != nil && !*force {
+		fatal(fmt.Errorf("generation %d is only part written: %s still to go (%s)\n"+
+			"  finish it with kura write, or pass -force to abandon it and plan a new generation",
+			prev.Generation, count(int64(len(left)), "volume"), strings.Join(left, ", ")))
+	}
+	if len(cat.Records) == 0 {
+		fmt.Fprintf(os.Stderr, "note: %s holds nothing yet; treating this as generation 1\n", wd)
+	}
+
 	fmt.Fprintf(os.Stderr, "scanning %s ...\n", strings.Join(scanning, " "))
 	started := time.Now()
 	files, stats, err := scan.Walk(parsed, ex, onErr)
@@ -146,14 +169,6 @@ Flags:
 	}
 	fmt.Fprintf(os.Stderr, "scanned %d files (%s) in %s\n",
 		stats.Files, plan.FormatBytes(stats.Bytes), time.Since(started).Round(time.Millisecond))
-
-	cat, err := catalog.Load(*catalogPath)
-	if err != nil {
-		fatal(err)
-	}
-	if *catalogPath != "" && len(cat.Records) == 0 {
-		fmt.Fprintf(os.Stderr, "note: catalog %s is empty or absent; treating this as generation 1\n", *catalogPath)
-	}
 
 	delta := scan.Diff(files, cat, scan.Options{
 		Match:       match,
@@ -201,10 +216,21 @@ Flags:
 		NamePrefix:      *prefix,
 		StartIndex:      *startIndex,
 		Layout:          lay,
-		MetadataReserve: metadataReserve(*catalogPath, len(cat.Records)+len(toWrite), *copies),
+		MetadataReserve: metadataReserve(wd.Catalog(), len(cat.Records)+len(toWrite), *copies),
 	})
 	p.Generation = gen
 	p.Created = time.Now().UTC().Format(time.RFC3339)
+	// What this plan was computed against, so the writer does not have to be
+	// told again and cannot be told wrong (DESIGN §10.2). Archive comes from
+	// the workdir rather than the catalog: a first cycle has no catalog yet,
+	// and the workdir under the root is already named by the archive it holds.
+	// The plan's own ID borrows the archive generator because both want the
+	// same thing — 16 random bytes — and neither is derived from its contents.
+	p.Workdir = wd.Path
+	p.Archive = wd.Archive()
+	if p.ID, err = archive.NewArchiveID(); err != nil {
+		fatal(err)
+	}
 	p.Finalize(delta, stats, items)
 
 	writeReport(os.Stdout, p, delta, stats, *allowSplit)
@@ -213,11 +239,34 @@ Flags:
 		fmt.Fprintf(os.Stderr, "\n(%d more warnings suppressed)\n", warned-50)
 	}
 
-	if *outPath != "-" && *outPath != "" {
+	// "-out -" is a dry look at the delta and writes nothing anywhere, which is
+	// the one case where suppressing the workdir's copy is right: it means the
+	// operator asked what a cycle would do, not for a cycle.
+	if *outPath == "-" {
+		fmt.Printf("\nno plan written (-out -)\n")
+		return
+	}
+
+	// Otherwise the workdir's copy comes first and unconditionally, because it
+	// is the one kura write reads. A plan the operator has to carry to the next
+	// command is the thing this interface exists to remove.
+	if err := writePlanFile(p, wd.Plan()); err != nil {
+		fatal(err)
+	}
+	fmt.Printf("\nplan written to %s\n", wd.Plan())
+	// Echoed with the same workdir selection this run used, because a plan made
+	// somewhere other than the default root is one the next command has to be
+	// pointed at again.
+	where := ""
+	if *state.dir != "" {
+		where = " -workdir " + wd.Path
+	}
+	fmt.Printf("next: kura write -mount <where you loaded a cartridge>%s\n", where)
+	if *outPath != "" {
 		if err := writePlanFile(p, *outPath); err != nil {
 			fatal(err)
 		}
-		fmt.Printf("\nplan written to %s\n", *outPath)
+		fmt.Printf("copy written to %s\n", *outPath)
 	}
 	if *listsDir != "" {
 		if err := writeLists(p, *listsDir); err != nil {
@@ -229,10 +278,10 @@ Flags:
 
 func runHistory(argv []string) {
 	fs := flag.NewFlagSet("history", flag.ExitOnError)
-	catalogPath := fs.String("catalog", "", "catalog to read")
+	state := registerState(fs)
 	fs.Parse(argv)
 
-	cat, err := catalog.Load(*catalogPath)
+	cat, err := catalog.Load(state.open().Catalog())
 	if err != nil {
 		fatal(err)
 	}
@@ -241,9 +290,9 @@ func runHistory(argv []string) {
 
 func runAtGen(argv []string) {
 	fs := flag.NewFlagSet("at-gen", flag.ExitOnError)
-	catalogPath := fs.String("catalog", "", "catalog to read")
+	state := registerState(fs)
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "kura at-gen [-catalog PATH] GENERATION\n\nFlags:\n")
+		fmt.Fprintf(os.Stderr, "kura at-gen [flags] GENERATION\n\nFlags:\n")
 		fs.PrintDefaults()
 	}
 	fs.Parse(argv)
@@ -256,7 +305,7 @@ func runAtGen(argv []string) {
 	if err != nil {
 		fatal(err)
 	}
-	cat, err := catalog.Load(*catalogPath)
+	cat, err := catalog.Load(state.open().Catalog())
 	if err != nil {
 		fatal(err)
 	}
@@ -266,6 +315,45 @@ func runAtGen(argv []string) {
 	if writeStateAt(os.Stdout, cat, gen) > 0 {
 		os.Exit(1)
 	}
+}
+
+// unfinishedCycle reports the plan already in the workdir when it still has
+// volumes to write, together with which ones.
+//
+// While the operator named the plan file, replacing one was their own doing.
+// Now that kura owns it, a second `kura plan` would overwrite the only copy of
+// a cycle that has cartridges on the shelf and more to write. No bytes are
+// lost — files that were never written are still new, so the next cycle picks
+// them up — but the volumes already written are stranded part way through a
+// plan nothing can finish, and the cartridges they were filling are wasted.
+//
+// Part written is the whole condition, and both halves matter. A plan nothing
+// has been written from is free to replace — that is planning twice before
+// committing any media, which is an ordinary thing to do and is how an operator
+// reconsiders. A plan every volume of which is written is a finished cycle and
+// has nothing left to strand.
+//
+// A plan this build cannot read is treated as nothing to protect. It cannot be
+// executed either, so refusing on it would wedge the workdir with no way out
+// but deleting a file the operator is no longer supposed to be handling.
+func unfinishedCycle(wd workdir.Dir, cat *catalog.Catalog) (*plan.Plan, []string) {
+	prev, err := loadPlan(wd.Plan())
+	if err != nil {
+		return nil, nil
+	}
+	var left []string
+	written := 0
+	for _, pv := range prev.Volumes {
+		if alreadyWritten(cat, pv.ID, prev.Generation) {
+			written++
+			continue
+		}
+		left = append(left, pv.ID)
+	}
+	if written == 0 || len(left) == 0 {
+		return nil, nil
+	}
+	return prev, left
 }
 
 func writePlanFile(p *plan.Plan, path string) (err error) {

@@ -35,10 +35,10 @@
     with subtest("the plan holds back room for the volume's own index"):
         kura(
             machine, "plan",
-            "-root", STORAGE, "-catalog", CATALOG, "-out", PLAN,
+            "-root", STORAGE, "-workdir", WORKDIR,
             "-capacity", "160MB", "-max-group", "32MB",
         )
-        p = read_json(machine, PLAN)
+        p = read_json(machine, plan_path())
         assert len(p["volumes"]) == 1, f"expected a single-volume plan, got {len(p['volumes'])}"
         vol = p["volumes"][0]
         # Without this the last object can fill the volume exactly and leave
@@ -50,7 +50,7 @@
     with subtest("writing it to a cartridge that cannot hold it fails against the device"):
         blank(machine, 1)
         mount = load(machine, 1)
-        status, out = kura_status(machine, "write", "-plan", PLAN, "-catalog", CATALOG, "-mount", mount, "-quiet")
+        status, out = kura_status(machine, "write", "-workdir", WORKDIR, "-mount", mount, "-quiet")
         unload(machine)
 
         assert status != 0, f"a write past the end of the medium reported success:\n{out}"
@@ -61,13 +61,13 @@
         # failed write leaves no record claiming the data is safe. That is the
         # property that matters: an archive may lose a write, but it must never
         # believe it holds something it does not.
-        out = kura(machine, "volumes", "-catalog", CATALOG)
+        out = kura(machine, "volumes", "-workdir", WORKDIR)
         assert_contains(out, "no volumes recorded yet", "inventory after a failed write")
 
     with subtest("a plan sized to the medium writes, verifies and restores"):
         kura(
             machine, "plan",
-            "-root", STORAGE, "-catalog", CATALOG, "-out", PLAN,
+            "-root", STORAGE, "-workdir", WORKDIR,
             "-capacity", "48MB", "-max-group", "16MB",
         )
         volumes = plan_volumes(machine)

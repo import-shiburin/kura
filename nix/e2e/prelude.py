@@ -18,8 +18,12 @@ import shlex
 from datetime import timedelta
 
 STORAGE = "/srv/storage"
-CATALOG = "/var/lib/kura/catalog.jsonl.gz"
-PLAN = "/var/lib/kura/plan.json"
+
+# One workdir per archive, named by the operator rather than by the archive ID,
+# because a scenario has to name the same archive again before any ID exists.
+# The archive-ID form under KURA_HOME is what an operator gets; it is exercised
+# in workdir.nix rather than assumed by every scenario here.
+WORKDIR = "/var/lib/kura/main"
 COVERAGE_DIR = "/var/lib/kura-coverage"
 
 
@@ -142,12 +146,13 @@ def read_json(machine, path):
     return json.loads(machine.succeed(f"cat {shlex.quote(path)}"))
 
 
-def catalog_header(machine, path=CATALOG):
+def catalog_header(machine, path=None):
     """The catalog's header line, decompressed in the guest.
 
     Read with python rather than `zcat | head -1`, which fails under the
     driver's `set -o pipefail` when head closes the pipe early.
     """
+    path = path or catalog_path()
     prog = (
         "import gzip,json,sys;"
         "f=gzip.open(sys.argv[1]) if sys.argv[1].endswith('.gz') else open(sys.argv[1],'rb');"
@@ -156,9 +161,23 @@ def catalog_header(machine, path=CATALOG):
     return json.loads(machine.succeed(f"python3 -c {shlex.quote(prog)} {shlex.quote(path)}"))
 
 
-def plan_volumes(machine, path=PLAN):
+def catalog_path(workdir=WORKDIR):
+    """Where a workdir keeps its catalog.
+
+    Scenarios read it directly to assert on the header; nothing passes it to
+    kura, which is the entire point of the workdir — see DESIGN §10.3.
+    """
+    return os.path.join(workdir, "catalog.jsonl.gz")
+
+
+def plan_path(workdir=WORKDIR):
+    """Where kura plan leaves the plan kura write picks up."""
+    return os.path.join(workdir, "plan.json")
+
+
+def plan_volumes(machine, path=None):
     """The volume IDs a plan lays out, in order."""
-    p = read_json(machine, path)
+    p = read_json(machine, path or plan_path())
     return [v["id"] for v in p.get("volumes", [])]
 
 
@@ -207,7 +226,7 @@ def delta_counts(report):
     return counts
 
 
-def write_volume(machine, slot, *extra, check=True):
+def write_volume(machine, slot, *extra, workdir=WORKDIR, check=True):
     """The operator's inner loop: load a cartridge, write one volume, eject.
 
     Each write is its own process that exits before the next cartridge goes in.
@@ -220,22 +239,22 @@ def write_volume(machine, slot, *extra, check=True):
     `-volume X` through `extra` to write a particular volume of the plan.
     """
     mount = load(machine, slot)
-    out = kura(machine, "write", "-plan", PLAN, "-catalog", CATALOG, "-mount", mount, *extra, check=check)
+    out = kura(machine, "write", "-workdir", workdir, "-mount", mount, *extra, check=check)
     unload(machine)
     return out
 
 
-def verify_volume(machine, slot, *extra, check=True):
+def verify_volume(machine, slot, *extra, workdir=WORKDIR, check=True):
     mount = load(machine, slot)
-    out = kura(machine, "verify", "-catalog", CATALOG, "-mount", mount, *extra, check=check)
+    out = kura(machine, "verify", "-workdir", workdir, "-mount", mount, *extra, check=check)
     unload(machine)
     return out
 
 
-def restore_volume(machine, slot, into, *extra, check=True):
+def restore_volume(machine, slot, into, *extra, workdir=WORKDIR, check=True):
     mount = load(machine, slot)
     machine.succeed(f"mkdir -p {shlex.quote(into)}")
-    out = kura(machine, "restore", "-catalog", CATALOG, "-mount", mount, "-into", into, *extra, check=check)
+    out = kura(machine, "restore", "-workdir", workdir, "-mount", mount, "-into", into, *extra, check=check)
     unload(machine)
     return out
 

@@ -832,6 +832,125 @@ Discovery is not access — SG_IO still wants the privileges — and none of it
 touches §8.1's open question of whether the drive answers LOG SENSE at all while
 ltfs holds the mount.
 
+### 10.2 The plan and the catalog are one pair
+
+`write` took `-plan` and `-catalog` as independent arguments and never compared
+them. They were never independent: **a plan is a delta against one catalog**,
+and its volume IDs, its generation and its deletion list mean nothing beside a
+different one.
+
+Crossing them was silent and unrecoverable. The plan's volume ID was stamped
+onto a blank cartridge next to the *other* archive's ID, the other catalog
+recorded files on a volume belonging to neither archive, and `verify` then
+reported that cartridge **Clean** — because after the fact the arrangement is
+entirely self-consistent. `volumes` listed it without comment. There is no
+later check that could have found it, which is why this one has to run before
+the first object is placed.
+
+So the plan records what it was computed against, in three optional fields:
+
+| Field | Purpose |
+|---|---|
+| `catalog` | absolute path — the default for `-catalog`, so the pair is named once |
+| `archive` | the archive that catalog belonged to; empty until the archive has been written to once |
+| `id` | this plan, distinct from every other |
+
+**Not a fingerprint of the catalog file.** The obvious check — hash the catalog
+the plan was built from, compare at write — is wrong here, and wrong in a way
+that only shows up on the second cartridge: `write` rewrites the catalog after
+every volume, so volume 2 of a plan legitimately meets a different file than
+the plan was built from. What has to match is the *lineage*, which is the
+archive, and the *cycle*, which is the plan.
+
+**Two checks, because one does not reach.** The archive comparison is exact but
+blind during an archive's first cycle: a plan made against an empty catalog has
+no archive ID to carry, and that is precisely when two fresh archives look
+alike. So `GenerationInfo` gains a `plan` field — whichever plan wrote a
+generation's first volume is named in the timeline, and the rest of that cycle
+has to be the same plan. That also catches the ordinary version of the mistake,
+which is not two archives at all but two plan files for one cycle: re-planning
+only advances the generation once a volume of the current one has landed.
+
+**An absent field is a check that does not run, never one that fails.** All
+three are optional so an older plan file still works, and both sides of the
+cycle comparison can be missing. Getting this wrong strands a cycle halfway
+through on nothing but a version difference — which the first draft did, caught
+by `TestPlanWithoutIdentityIsNotRefused`. The same rule is what keeps an
+interrupted *first* write resumable: the archive ID is persisted before the
+first object, so that catalog names an archive while holding no records and no
+timeline entry, and any check strict enough to refuse it would re-create the
+orphaned-cartridge bug §11 exists to prevent.
+
+**The plan is also a third source of archive identity**, after the medium and
+before minting. `ensureArchiveID` prefers the loaded volume, because the medium
+is the authority; but a catalog lost entirely, with a blank cartridge in the
+drive, previously minted a second identity for an archive that already had one.
+The plan remembers.
+
+### 10.3 The workdir: the operator names no state at all
+
+§10.2 stopped the operator from having to name the catalog *twice*. The
+question it did not ask is why they were naming it at all.
+
+**The catalog is kura's bookkeeping, not the operator's file.** Every command
+took `-catalog`, and that leaked an internal artifact into the interface three
+ways at once. The operator became responsible for a file they cannot usefully
+read or repair. Container staging silently landed in whatever directory the
+catalog happened to sit in — `StageDir: filepath.Dir(catalogPath)`, a coupling
+nobody chose. And two independent path arguments could name state belonging to
+two different archives, which is the failure §10.2 exists to catch.
+
+So there is **one directory per archive**, and the commands take that:
+
+```
+/var/lib/kura/<archive-id>/       $KURA_HOME overrides the root
+  catalog.jsonl.gz                the index
+  plan.json                       the current cycle
+  stage/                          containers, assembled before being placed
+```
+
+| | |
+|---|---|
+| `-workdir <dir>` | that directory, wherever it is |
+| `-archive <id>` | which archive, when the root holds several |
+| neither | the one archive under the root — the ordinary case |
+
+**Resolution is the search an operator would do by hand.** The named directory
+if it is itself a workdir; then `<dir>/<archive-id>` if an archive was named;
+then the single archive under the root. Several archives and no `-archive` is
+an error rather than a choice — one host really does hold more than one, since
+§8.1 prefers a second archive to erasure coding, and a rule that picked would
+eventually pick wrong on a command that writes 2.5 TB.
+
+**`-archive` is an assertion, not a lookup.** It mirrors `-volume` for `verify`
+and `restore`: a script that meant a particular archive is stopped rather than
+pointed at whichever one the path turned out to hold. Making it a lookup would
+need a registry, and could not name a brand-new archive at all.
+
+**The archive ID is now minted by `plan`, not by the first write.** This is a
+reversal, and it is forced: a workdir named by its archive needs that name
+before `plan` can place a single file, and `plan` runs before any cartridge
+exists. It costs nothing that was being relied on. The medium stays the
+authority — `ensureArchiveID` still prefers what the loaded volume says, and
+takes the plan's ID only when the catalog has none, ahead of minting a second
+identity for an archive that already has one. If anything the
+interrupted-first-write hazard shrinks: the ID reaches a file on disk before
+any object is written rather than during the write that might be killed.
+
+**A workdir is still a cache.** DESIGN §11 is unchanged: delete the directory
+and it rebuilds from any cartridge the archive owns.
+
+**`plan` refuses to replace a part-written cycle.** While the operator named
+the plan file, overwriting one was their own doing; now that kura owns it, a
+second `kura plan` would destroy the only copy of a cycle that has cartridges
+on the shelf and volumes still to write. No bytes are lost — files that were
+never written are still new, and the next cycle picks them up — but the volumes
+already written are stranded in a plan nothing can finish. *Part* written is the
+whole condition: a plan nothing has been written from is free to replace, which
+is how an operator reconsiders before committing media, and a plan every volume
+of which is written is a finished cycle with nothing left to strand. `-force`
+is the way past it.
+
 ---
 
 ## 11. Startup reconciliation

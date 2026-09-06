@@ -42,7 +42,7 @@
         make_source(machine, spec="tiny=200,small=120,medium=20", seed=61)
         kura(
             machine, "plan",
-            "-root", STORAGE, "-catalog", CATALOG, "-out", PLAN,
+            "-root", STORAGE, "-workdir", WORKDIR,
             "-capacity", "56MB", "-max-group", "16MB",
         )
         volumes = plan_volumes(machine)
@@ -56,13 +56,13 @@
         for slot in range(1, len(volumes) + 1):
             blank(machine, slot)
         write_volume(machine, 1, "-quiet")
-        assert_contains(kura(machine, "volumes", "-catalog", CATALOG), volumes[0], "inventory")
+        assert_contains(kura(machine, "volumes", "-workdir", WORKDIR), volumes[0], "inventory")
 
     with subtest("a write killed mid-flight leaves objects but no catalog record"):
         mount = load(machine, 2)
         start_background(
             machine,
-            f"kura write -plan {PLAN} -catalog {CATALOG} -mount {mount} -quiet -volume {volumes[1]}",
+            f"kura write -workdir {WORKDIR} -mount {mount} -quiet -volume {volumes[1]}",
             "/tmp/write1.pid",
             "/tmp/write1.log",
         )
@@ -75,7 +75,7 @@
         # This is also the proof that the kill landed mid-write rather than
         # after it: archive.Write returns before the catalog is written, so a
         # run that finished would have recorded this volume.
-        inventory = kura(machine, "volumes", "-catalog", CATALOG)
+        inventory = kura(machine, "volumes", "-workdir", WORKDIR)
         assert volumes[1] not in inventory, (
             f"{volumes[1]} was recorded despite the kill; the write outran it:\n{inventory}"
         )
@@ -91,7 +91,7 @@
         mount = load(machine, 3)
         start_background(
             machine,
-            f"kura write -plan {PLAN} -catalog {CATALOG} -mount {mount} -quiet -volume {volumes[2]}",
+            f"kura write -workdir {WORKDIR} -mount {mount} -quiet -volume {volumes[2]}",
             "/tmp/write2.pid",
             "/tmp/write2.log",
         )
@@ -124,20 +124,19 @@
         # Two things close it, and this checks both. The ID is persisted before
         # any object is written, and the identity now lives in an object of its
         # own so a volume can hand it back.
-        FRESH = "/var/lib/kura/fresh.jsonl.gz"
-        FRESH_PLAN = "/var/lib/kura/fresh-plan.json"
+        FRESH = "/var/lib/kura/fresh"
         kura(
             machine, "plan",
-            "-root", STORAGE, "-catalog", FRESH, "-out", FRESH_PLAN,
+            "-root", STORAGE, "-workdir", FRESH,
             "-capacity", "56MB", "-max-group", "16MB", "-prefix", "NEW",
         )
-        fresh = plan_volumes(machine, FRESH_PLAN)
+        fresh = plan_volumes(machine, plan_path(FRESH))
 
         blank(machine, 4)
         mount = load(machine, 4)
         start_background(
             machine,
-            f"kura write -plan {FRESH_PLAN} -catalog {FRESH} -mount {mount} -quiet -volume {fresh[0]}",
+            f"kura write -workdir {FRESH} -mount {mount} -quiet -volume {fresh[0]}",
             "/tmp/write3.pid",
             "/tmp/write3.log",
         )
@@ -147,26 +146,26 @@
         assert stamped["archive"], "the medium was not stamped before objects were written"
 
         # The catalog exists and names the same archive, despite the kill.
-        header = catalog_header(machine, FRESH)
+        header = catalog_header(machine, catalog_path(FRESH))
         assert header.get("archive") == stamped["archive"], (
             f"catalog names {header.get('archive')!r}, the medium names {stamped['archive']!r}"
         )
 
-        kura(machine, "write", "-plan", FRESH_PLAN, "-catalog", FRESH,
+        kura(machine, "write", "-workdir", FRESH,
              "-mount", mount, "-volume", fresh[0], "-quiet")
         unload(machine)
 
         mount = load(machine, 4)
-        assert_contains(kura(machine, "verify", "-catalog", FRESH, "-mount", mount), "Clean.", "verify of the finished volume")
+        assert_contains(kura(machine, "verify", "-workdir", FRESH, "-mount", mount), "Clean.", "verify of the finished volume")
         unload(machine)
 
     with subtest("a catalog that lost its archive ID adopts the medium's"):
         # The stronger half: the medium is the authority (DESIGN §11), so even
         # a catalog destroyed outright is repaired from any cartridge rather
         # than minting a second identity for an archive that already has one.
-        machine.succeed(f"rm {FRESH}")
+        machine.succeed(f"rm {catalog_path(FRESH)}")
         mount = load(machine, 4)
-        out = kura(machine, "write", "-plan", FRESH_PLAN, "-catalog", FRESH,
+        out = kura(machine, "write", "-workdir", FRESH,
                    "-mount", mount, "-volume", fresh[0], "-quiet")
         unload(machine)
         assert_contains(out, "adopting archive " + stamped["archive"], "adoption from the medium")
