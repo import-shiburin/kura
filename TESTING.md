@@ -266,6 +266,12 @@ helper in scope.
 | `incremental` | a second generation. Content changed behind an unchanged size *and* mtime, so only ctime differs; deletions and additions; restore of either generation. |
 | `capacity` | a plan that over-promises the medium. The refusal comes from the kernel, and nothing is recorded as written. |
 | `interrupted-write` | SIGKILL mid-write, then a power cut mid-write. Both must resume to a volume that verifies and restores. |
+| `workdir` | a cycle with nothing named; a plan from another archive refused; two archives under the root told apart. |
+| `rename` | a file moved between cycles. The scan matches it, nothing is written, and it has to stay in the archive. |
+| `colliding-ids` | the default IDs: a second generation and a second archive both name LTO001. A plan must not reuse a written ID, a written cartridge must never swallow an edit, and every command must check whose cartridge it holds. |
+| `resume-trust` | a killed write resumed after the source was edited and an object was zero-filled. The archive has to converge on the source, not on the medium. |
+| `split-rewrite` | a file spanning cartridges, rewritten between them behind a restored mtime. No restore may stitch two versions, and the record has to carry a ctime. |
+| `scan-failure` | a root that does not exist, and a root that is a symlink. Neither may scan as an empty tree. |
 
 ## Current state
 

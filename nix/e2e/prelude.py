@@ -177,8 +177,10 @@ def plan_path(workdir=WORKDIR):
 
 def plan_volumes(machine, path=None):
     """The volume IDs a plan lays out, in order."""
+    # A plan with nothing to write serialises its volumes as null, not [], and
+    # a generation that only moved or removed files is exactly such a plan.
     p = read_json(machine, path or plan_path())
-    return [v["id"] for v in p.get("volumes", [])]
+    return [v["id"] for v in p.get("volumes") or []]
 
 
 def manifest(machine, root):
