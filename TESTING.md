@@ -214,6 +214,15 @@ anything that has to happen *during* a write cannot be driven from the driver
 side — a hundred-megabyte write finishes in about one poll. `killwhen` runs the
 watch loop inside the guest for exactly this reason.
 
+`pause` needed one more turn of that screw, and it is the pattern to copy for
+anything that has to be *asked* of a running write rather than done to it. The
+guest freezes the writer with `SIGSTOP` once it has placed its first objects, the
+request is made against a process that cannot outrun it, and the freeze is held
+for two seconds because the flag file is stat'd at most once a second — a writer
+let go inside that window finishes the volume before it looks again. `SIGSTOP` is
+not a signal kura handles, so nothing under test changes; it only makes
+"mid-volume" a fact instead of a hope.
+
 ### Cartridges
 
 Slots are addressed by qemu serial (`/dev/disk/by-id/virtio-kura-slot-N`),
@@ -266,6 +275,7 @@ helper in scope.
 | `incremental` | a second generation. Content changed behind an unchanged size *and* mtime, so only ctime differs; deletions and additions; restore of either generation. |
 | `capacity` | a plan that over-promises the medium. The refusal comes from the kernel, and nothing is recorded as written. |
 | `interrupted-write` | SIGKILL mid-write, then a power cut mid-write. Both must resume to a volume that verifies and restores. |
+| `pause` | the third way a write ends, and the only one with a promise attached. `kura pause` mid-volume exits 75 having committed nothing; the host is switched off and brought back; the same volume is then finished from the checkpoint without a byte read back. Also: a withdrawn request, a stale one cleared rather than obeyed, a paused *first* volume still counting as a part-written cycle, one volume's pause left alone while another is written, and a second signal taking the crash it asked for. |
 | `workdir` | a cycle with nothing named; a plan from another archive refused; two archives under the root told apart. |
 | `rename` | a file moved between cycles. The scan matches it, nothing is written, and it has to stay in the archive. |
 | `colliding-ids` | the default IDs: a second generation and a second archive both name LTO001. A plan must not reuse a written ID, a written cartridge must never swallow an edit, and every command must check whose cartridge it holds. |
@@ -277,34 +287,44 @@ helper in scope.
 
 | | unit only | unit + e2e |
 |---|---:|---:|
-| `kura/cmd/kura` | 26.07% | **87.04%** |
-| `kura/internal/archive` | 75.29% | 78.63% |
-| `kura/internal/catalog` | 87.75% | 88.73% |
+| `kura/cmd/kura` | 55.19% | **87.34%** |
+| `kura/internal/archive` | 80.70% | 81.15% |
+| `kura/internal/catalog` | 90.43% | 90.87% |
 | `kura/internal/plan` | 94.12% | 94.12% |
-| `kura/internal/scan` | 88.59% | 91.07% |
+| `kura/internal/scan` | 90.82% | 93.30% |
 | `kura/internal/volume` | 100.00% | 100.00% |
-| `kura/internal/volume/filevol` | 80.56% | 81.11% |
-| **total** | **67.41%** | **86.35%** |
+| `kura/internal/volume/filevol` | 81.01% | 81.56% |
+| **total** | **76.25%** | **87.12%** |
 
-`cmd/kura` is the whole argument: it is argument handling, refusals and
-operator output, nearly all of it behind an `os.Exit` that no in-process test
-survives. Eight VM scenarios took it from a quarter covered to seven eighths.
+`cmd/kura` is the whole argument: it is argument handling, refusals and operator
+output, nearly all of it behind an `os.Exit` that no in-process test survives.
+The scenarios take it from just over half covered to seven eighths.
 
-The floors in `.covcheck.json` are the right-hand column, rounded down. 332
-statements in 274 blocks remain — `covcheck uncovered` lists them, and after
-the easy ones they are mostly I/O error paths that need injected failures
-rather than more scenarios.
+**The right-hand column is nine scenarios, not fourteen.** `resume-trust`,
+`rename`, `colliding-ids`, `split-rewrite` and `scan-failure` fail — at HEAD as
+well, for the defects the specs added in `fable review pass 1` describe — and
+`nix/coverage.nix` depends on every scenario building, so `nix build .#coverage`,
+`make cover-gate` and `make cover-all` cannot complete at all. The numbers above
+were produced by merging unit coverage with the nine that do build, from one
+consistent source tree; they are therefore a **lower bound**, and every package
+clears its floor even so.
 
-Note the honest denominator. Measured per package in isolation the unit suite
-reads several points higher; `-coverpkg=kura/...` is what turns that into
-67.41%, and the lower number is the true one.
-
-To raise the floors after adding tests:
+Two consequences. A failing gate right now is not evidence about the change in
+front of you — check the scenario list first. And **do not ratchet from a partial
+profile**: `.covcheck.json`'s floors are defined as what the *whole* suite
+reaches, so raising them from a nine-scenario merge would quietly redefine what
+the contract measures. Ratchet after the five are green, and then with both:
 
 ```sh
 make cover-gate                  # merges unit + e2e into coverage/all.profile
 make cover-ratchet               # raises every floor to what that reached
 ```
+
+Until then, the way to measure one change honestly is to merge unit counters with
+the scenarios that do build **from a single source tree** — counters from two
+revisions of the same package do not merge, they accumulate, and the inflated
+denominator reads as a coverage collapse that is not there. `covcheck uncovered`
+still says what to write next from whatever profile it is handed.
 
 ### Four defects found so far, all fixed
 

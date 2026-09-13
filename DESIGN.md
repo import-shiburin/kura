@@ -966,6 +966,191 @@ The medium is the authority; the local database is a cache.
 | Foreign | Different archive UUID | Refuse, and name the archive it belongs to |
 | Blank | No header | Offer to initialise, with confirmation |
 
+### 11.1 Pausing a write, and telling a pause from a crash
+
+A volume takes hours. The operator wants the host back, or the building loses
+power on a schedule, so `write` has to be stoppable — and the only stop worth
+having is one that survives the machine being turned off, because "leave it
+running but idle" is precisely the `tar -M` failure this tool exists to avoid.
+
+So **a pause is not a process state.** It is a clean stop, and the resume is the
+same command run again. Most of that already exists: `existing()` indexes what
+the medium holds, and a re-run recognises its own earlier objects rather than
+failing on the first name it already used.
+
+What is new is the distinction. A crash and a pause leave the same medium
+behind, and they have earned opposite amounts of trust.
+
+**Stop after the object, never inside it.** The check sits between objects —
+including between the staging and the placing of a container — so whatever was
+in flight is finished and whole. Mid-object cancellation was considered for the
+sake of a faster stop and is wrong here: an object name is a pure function of
+its path, `Put` refuses to overwrite, and the medium never reclaims, so a
+half-written object that had to be abandoned would burn its own name. The price
+is latency. The bound is one object, which on the real archive means the largest
+single file — 513 of them exceed 10 GiB — or `-tar-max` for a container. At
+LTO-6 speeds a 100 GiB file is minutes of apparent deafness, so the request is
+acknowledged immediately and names what it is waiting for. A second request
+stops at once and accepts being a crash.
+
+**Sync, then the marker.** The ordering is the whole guarantee. `Put` promises
+atomicity and `Sync` promises durability (DESIGN §8.1a), and a host that powers
+off takes the page cache with it, so a pause flushes the volume *before* it
+records that it paused. The marker therefore cannot exist unless the bytes it
+describes are durable, which makes its presence exactly co-extensive with the
+thing a resume needs to believe. A crash has neither half.
+
+On tape that guarantee is only as good as `Volume.Sync`, which is not yet built
+and which §10.1 expects to be the `ltfs.sync` extended attribute — an assumption,
+not a measurement. If it turns out that LTFS only lands its index at unmount,
+then a pause on tape is durable at unmount and not before, and the honest shape
+of this changes: the marker would have to be written after the volume is
+released rather than after the flush, and "switch the host off" would become
+"eject first, then switch the host off". The file backend has no such doubt; its
+`Sync` fsyncs every object and then every directory that names one.
+
+**The marker is local, and the medium carries no trace of it.** It lives in the
+workdir beside the plan and the catalog. Three reasons, in order of weight. The
+medium has no room for it: nothing mutable goes at the root, overwriting a name
+is an error, so a marker on the medium would have to be a fresh object under
+`generations/gNNNN/` per pause, stranding the previous one on media that cannot
+reclaim. "Was this stop deliberate?" is a fact about the process that stopped,
+and the process's state is local by construction — the medium stays the
+authority on what *exists*, which `existing()` already reads off it. And a
+marker that can go missing fails in the safe direction: a lost workdir, or a
+resume on another host, falls back to the crash path, which is correct rather
+than broken. **The on-media format does not change for any of this.**
+
+**A resumed pause is trusted. A resumed crash is not.** The tempting answer is
+to re-read the medium either way and trust nothing, and it is wrong three times
+over.
+
+It is redundant. The verification wanted here already exists and is already
+mandatory: `verify` reads the whole volume back against its digests at the end
+of the cycle. A re-read at resume is a third pass over the same bytes — write,
+resume, verify — and catches nothing the third pass does not.
+
+It is weaker than it looks. A re-read compares the medium against itself, so it
+cannot see that a source file was edited at the same size while the host was
+off, which is the first hazard `resume-trust.nix` names. A marker holds each
+source's size, ctime and inode as of the read, so the resume re-stats and
+catches exactly that, for a `stat` rather than a read.
+
+And it is not free of consequences. An object name is a pure function of its
+path, so a resume that decides it cannot vouch for an object **cannot replace
+it** — there is no second name to write it under on this volume. All it can do
+is report the file, leave it out of the catalog, and let the next cycle put it
+on a different cartridge, which is what `resume-trust.nix` demands. The object
+stays where it is, indexed by nothing, on media that never reclaims. That cost
+is forced for a crash, whose records died with the process. It is not forced for
+a pause, which saved them.
+
+So: a pause saves the records it computed, and a resume adopts them after
+checking that the world has not moved under it.
+
+| Gate | Why |
+|---|---|
+| archive, plan ID, generation, volume ID all match | A marker is bound to one cycle for the same reason a plan is (§10.2). It is a third thing that can be crossed with a plan and a catalog, and the workdir is what keeps it uncrossable by accident |
+| the medium still holds each object at the recorded length | The marker describes the medium; if they disagree the marker is stale, whatever the reason |
+| each source still stats to the recorded size, ctime and inode | The host may have been off for a week. A changed source means the record would describe bytes that are no longer what that path holds |
+
+A gate that fails does not invalidate the marker — the other objects are still
+adopted. But it does not drop that object to the crash path either, and the
+reason is the same one that makes the crash path expensive. The object's name is
+a pure function of its path, `Put` will not overwrite it, and the medium never
+reclaims, so there is no second name on this volume to write a corrected copy
+under. Reading it back would only compare the medium with itself. So a refused
+object is **reported and left out of the catalog**, and the next cycle writes
+that file to a different cartridge — which is exactly what `resume-trust.nix`
+asks for. The bytes stay where they are, indexed by nothing, which is the price
+of the refusal and is why the gates are cheap `stat`s rather than guesses.
+
+The marker is gzipped JSONL, a header line then one line per object, for the
+reason the catalog is. It holds an entry per file, and the archive's largest
+volume holds 539,275 of them: measured against that volume's real paths, one
+indented JSON object costs 1,247 bytes an entry — 673 MB, allocated whole and
+fsynced at every pause — where the streamed gzipped form costs 38, or 20.5 MB.
+Most of the difference is gzip absorbing the paths, which appear twice per entry
+because a source stamp and a record both name the file; that duplication is
+therefore left alone rather than engineered away.
+
+A marker vouches for a prefix and says plainly what it could not vouch for.
+`-verify-resumed` re-reads the adopted objects and checks them against the
+digests the marker holds, for an operator who would rather pay twice; it is off
+by default because the mandatory verify is the same check, done once.
+
+A marker that cannot be read at all — a format from a newer build, a file whose
+tail a full disk took — is **ignored with a warning, never fatal.** It is an
+optimisation over a path that still works, so a write must not be stopped by one.
+That is also why the header carries the number of objects in the stream: without
+it a truncated marker simply vouches for fewer objects, which looks exactly like a
+shorter pause, and a file that lost its tail is a file whose middle is in doubt.
+
+**Three things a pause must not do**, each of which was a real trap rather than a
+hypothetical one.
+
+It must not write the catalog onto the medium. The copies are named
+`generations/gNNNN/catalog.NNN.jsonl.gz`, `writeCatalog` skips a name already
+present, and overwriting is an error — so a mid-volume copy would be the one the
+volume keeps, and the cartridge would end up indexing only what preceded the
+pause. That is the generation-numbering bug of §8.1a arriving by a different
+road. A paused volume carries no on-media index until it finishes, exactly as a
+crashed one does.
+
+It must not write the catalog locally either. `alreadyWritten` decides which
+volume `write` picks next by looking for records of this generation on it, so
+committing a paused volume's records would make the next run skip the cartridge
+it is meant to be finishing. The records belong in the marker, which is what the
+marker is: the writer's uncommitted `Result.Records`.
+
+And the marker counts as a part-written cycle. `plan` refuses to replace a plan
+whose cycle is unfinished (§10.3), judged by whether any volume holds records of
+that generation — which a paused *first* volume does not. Without the marker in
+that test, a pause followed by `kura plan` would quietly abandon a cartridge
+holding objects that nothing indexes and no plan can finish.
+
+`-force` is still the way past that, and past it the marker is retired rather
+than left lying about — otherwise every write for the rest of the archive's life
+would report a pause nothing can resume. Retiring it is also the moment to name
+the cartridge, while the operator can still go and look at it: its objects are
+there, indexed by nothing, and the space does not come back. The files are safe,
+because nothing recorded them as stored and the new plan writes them again.
+
+Two smaller things fall out of the records living in the marker rather than the
+catalog, and both were found by building it. The files a run could not read are
+in the Result and nowhere else, so the marker has to carry them too or pausing a
+volume silently loses the one list that tells the operator what the next cycle
+owes a write. And the volume's inventory row counts only what the run that wrote
+it placed, so a cartridge finished from a marker that vouched for all but one of
+its objects was listed as holding that one object — on a real volume, most of a
+terabyte of under-reporting in the table an operator scrubs from. Objects carried
+rather than written now count towards the row and not towards the throughput
+figure, which are two different questions about the same bytes.
+
+**`kura pause`.** A signal is the obvious trigger and not a sufficient one: the
+write that most needs pausing is the one running for four hours under a unit
+file or behind an SSH session that has already dropped, where there is no
+terminal to press a key in. So there are two triggers and one predicate behind
+them. `SIGINT`, `SIGTERM` and `SIGHUP` all pause — `SIGHUP` included precisely
+because a dropped session is an unexpected halt today and a clean stop is
+strictly better than dying dirty — and `kura pause` sets a flag in the workdir
+that the running write notices. Neither is a mode: a `write` that was never
+asked to stop behaves as it always did.
+
+A pause exits **75**. Not 0, because a script that reads success would advance
+to the next cartridge and leave this one half written; not 1, because a pause is
+not a failure and should not page anybody. `EX_TEMPFAIL` is the meaning wanted —
+try again later — and it is the same code whether a signal or the flag asked for
+the stop, which a signal-derived 130 could not be.
+
+`verify` and `restore` stop on the same signals and need none of this apparatus.
+Neither has anything to commit: `verify` only reads, and `restore` writes each
+file through a temporary and a rename, so a stop leaves a correct subset of the
+tree and a re-run simply does it again. They cancel their context and say where
+they got to. `plan` is deliberately left out — a cold scan is 35 minutes and
+persists nothing mid-flight, so a clean stop there can only lose the scan; a
+scan journal is a different feature and has to argue for itself separately.
+
 ---
 
 ## 12. Implementation

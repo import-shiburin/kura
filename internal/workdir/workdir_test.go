@@ -292,3 +292,52 @@ func TestRootFallsBackToTheSystemPath(t *testing.T) {
 		t.Errorf("Root() is %q with no %s set, wanted %q", got, RootEnv, DefaultRoot)
 	}
 }
+
+// TestResumeAndPauseLiveBesideTheRestOfTheState keeps a pause's two files where
+// every other command can find them without being told.
+//
+// Neither may go on the medium: nothing mutable belongs at the root of a volume,
+// and overwriting an object name is an error, so a marker there would strand a
+// copy of itself per pause on media that never reclaims. DESIGN §11.1.
+func TestResumeAndPauseLiveBesideTheRestOfTheState(t *testing.T) {
+	d := At("/var/lib/kura/abc")
+	cases := map[string]string{
+		"catalog": d.Catalog(),
+		"plan":    d.Plan(),
+		"stage":   d.Stage(),
+		"resume":  d.Resume(),
+		"pause":   d.Pause(),
+	}
+	seen := make(map[string]string, len(cases))
+	for what, path := range cases {
+		if filepath.Dir(path) != d.Path {
+			t.Errorf("%s lives at %s, outside the workdir %s", what, path, d.Path)
+		}
+		if other, clash := seen[path]; clash {
+			t.Errorf("%s and %s are the same file, %s", what, other, path)
+		}
+		seen[path] = what
+	}
+	if d.Resume() != "/var/lib/kura/abc/resume.jsonl.gz" {
+		t.Errorf("the checkpoint is at %s", d.Resume())
+	}
+	if d.Pause() != "/var/lib/kura/abc/PAUSE" {
+		t.Errorf("the request flag is at %s", d.Pause())
+	}
+}
+
+// TestAPauseDoesNotMakeADirectoryLookLikeAnArchive keeps Resolve honest: a
+// checkpoint is not evidence that a workdir exists, because it can only have
+// been written by a run that already had a plan and a catalog beside it.
+func TestAPauseDoesNotMakeADirectoryLookLikeAnArchive(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ResumeName), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, PauseName), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if At(dir).Started() {
+		t.Error("a directory holding only a pause's files claimed to hold an archive")
+	}
+}

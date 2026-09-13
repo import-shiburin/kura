@@ -29,6 +29,8 @@ func main() {
 		runPlan(args)
 	case "write":
 		runWrite(args)
+	case "pause":
+		runPause(args)
 	case "verify":
 		runVerify(args)
 	case "restore":
@@ -59,6 +61,7 @@ Usage:
 Commands:
   plan      work out which files go on which volume, and write a plan
   write     place one volume's share of a plan, then exit
+  pause     ask the write in progress to stop at the next object
   verify    read one volume back and check it against its digests
   restore   write out what one volume holds, for a given generation
   volumes   the inventory: what exists, and what is overdue a check

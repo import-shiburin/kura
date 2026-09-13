@@ -96,18 +96,25 @@ restore.
 | | |
 |---|---|
 | `internal/volume` + `filevol` | the backend seam and directory-as-volume — 16 tests |
-| `internal/workdir` | one directory per archive: layout, resolution, `-archive` — 15 tests |
+| `internal/workdir` | one directory per archive: layout, resolution, `-archive`, the pause's two files — 17 tests |
 | `internal/catalog` | records, history queries, `Lost`, `Tombstone`, per-object cipher, cheap header read — 31 tests |
-| `internal/scan` | walk, exclusions, hashing, `Diff` — 31 tests |
+| `internal/scan` | walk, exclusions, hashing, `Diff` — 34 tests |
 | `internal/plan` | `Group`, `Layout`, `Pack` — 29 tests |
-| `internal/archive` | `Write`, `Verify`, `Restore`, containers, both headers, volume identity — 34 tests |
-| `cmd/kura` | `plan`, `write`, `verify`, `restore`, `volumes`, `history`, `at-gen`, plan/catalog pairing — 29 tests |
-| `nix/e2e/scenarios` | eight NixOS VMs: real cartridges, swaps, ENOSPC, power cuts — see [TESTING.md](TESTING.md) |
+| `internal/archive` | `Write`, `Verify`, `Restore`, containers, both headers, volume identity, pause and resume — 69 tests |
+| `cmd/kura` | `plan`, `write`, `pause`, `verify`, `restore`, `volumes`, `history`, `at-gen`, plan/catalog pairing — 40 tests |
+| `nix/e2e/scenarios` | NixOS VMs: real cartridges, swaps, ENOSPC, power cuts, a pause across a reboot — see [TESTING.md](TESTING.md) |
 
-185 tests. Exercised against a real 356-file tree across six volumes: written,
-verified, restored byte-identical, then a flipped byte inside a container caught
-and attributed to the one file it damaged, marked lost, and re-sourced by the
-next plan.
+236 tests, 22 of which fail. Those 22 arrived with `fable review pass 1`, which
+added nine test files and touched no production code: they are specifications
+for defects that are still open, not regressions. Five VM scenarios are red for
+the same reasons — `resume-trust`, `rename`, `colliding-ids`, `split-rewrite`,
+`scan-failure` — and because `nix/coverage.nix` depends on every scenario
+building, **`make cover-gate` and `make cover-all` cannot run at all** until
+they are fixed. Unit coverage and individual scenarios still work; do not read a
+failing gate as something the current change did. Exercised against a real
+356-file tree across six volumes: written, verified, restored byte-identical,
+then a flipped byte inside a container caught and attributed to the one file it
+damaged, marked lost, and re-sourced by the next plan.
 
 **How a cycle goes.**
 
@@ -117,9 +124,19 @@ kura write  -mount /mnt/lto     # repeat per cartridge, unchanged each time
 kura verify -mount /mnt/lto
 ```
 
+**A write can be stopped and picked up again.** Ctrl-C, SIGTERM, SIGHUP or
+`kura pause` all ask it to finish the object in flight, flush the volume, write
+down what it placed, and exit 75; the cartridge can then be ejected and the host
+switched off for as long as you like. Running `kura write` again resumes the same
+volume and does not read back what the pause vouched for. A run that *died*
+instead — killed, or a power cut — left nothing to vouch for, so its resume reads
+the medium to find out what is on it. That difference is the whole of DESIGN
+§11.1, and it is why the pause flushes before it records that it paused.
+
 **No command names kura's own files.** Each archive owns a workdir —
 `/var/lib/kura/<archive-id>/`, or `$KURA_HOME` — holding the catalog, the
-current plan and the container staging area. `plan` creates it; everything
+current plan, the container staging area, and the two files a pause uses:
+`resume.jsonl.gz` and `PAUSE`. `plan` creates it; everything
 after finds it. `-workdir` or `-archive` picks between several archives on one
 host, and `-archive` is an assertion rather than a lookup, the way `-volume` is
 for `verify`. DESIGN §10.3.
@@ -254,6 +271,30 @@ containers/gNNNN/<item>.partNNN.tar   everything below the threshold
   catalog records a volume that is on no medium. A test or a local run against a
   temp directory needs `-allow-any-dir`, which is stripped from argv rather than
   registered so that no `-h` can advertise it. DESIGN §10.1.
+- **A pause syncs before it records that it paused.** `Sync` is what makes the
+  objects durable and the checkpoint is what claims they are, so the order is
+  the guarantee. If the flush fails there is no checkpoint at all — and a
+  checkpoint written first would tell an operator they could switch the host off
+  over bytes still in the page cache. DESIGN §11.1.
+- **A pause writes no catalog, in either place.** On the medium, because
+  `writeCatalog` skips a name that already exists, so a mid-volume copy would be
+  the one the cartridge keeps and it would index only what preceded the pause —
+  the §8.1a naming bug by another road. Locally, because `alreadyWritten` is how
+  `write` picks the next volume, so committing the records would make the resume
+  skip the cartridge it is meant to be finishing. The records live in
+  `resume.jsonl.gz` until the volume is done.
+- **A refused adoption is a reported problem, not a fallback to reading.** When
+  a checkpoint can no longer be trusted for an object — the source moved, the
+  medium disagrees about its length — the file is reported and left out of the
+  catalog, and the next cycle writes it to another cartridge. Falling back to
+  re-reading would record the pre-pause bytes under the post-pause stat data,
+  which is exactly what `resume-trust.nix` forbids, and there is no second name
+  to write a corrected copy under on this volume anyway.
+- **The pause leaves nothing on the medium.** No format change was needed and
+  none should be added: nothing mutable goes at a volume's root, and a marker
+  under `generations/gNNNN/` would strand a copy of itself per pause. A
+  checkpoint that goes missing falls back to distrust, which is the safe
+  direction; one on the medium could not.
 - **Never rely on mtime alone.** See DESIGN §6. Ctime is nanoseconds, mtime is
   seconds, and that asymmetry is deliberate.
 - **We correct no errors.** Every layer below either corrects silently or
@@ -276,7 +317,7 @@ if one turns out wrong, follow the link to what has to move with it.
 | Read throughput degrades measurably on marginal media | Channel 3 of the degradation signals (DESIGN §8.1) | Needs a baseline first: collect MB/s per volume per scrub from the very first scrub, since a trend started late is worthless |
 | LTO-6 usable capacity ≈ 2.5 TB | Planning arithmetic | Do not assume — LTFS reserves for the index partition. Read free space from the mounted filesystem, which also picks up compression gain |
 | `/proc/self/mountinfo` reports LTFS as `fuse.ltfs` | How the LTFS backend is recognised without a `--backend` flag, and therefore which `Sync` runs (DESIGN §10.1) | `findmnt -o SOURCE,FSTYPE,MAJ:MIN /mnt/lto` against a mounted cartridge — one command, and it also says whether the source string happens to carry the device |
-| LTFS flushes its index on demand, via the `ltfs.sync` virtual EA | `Volume.Sync` on tape. Without it the index only lands at unmount, so durability would require owning the mount | Set the EA on a mounted cartridge and check the index generation moved. `syscall.Setxattr` is in the standard library, so the mechanism costs no dependency |
+| LTFS flushes its index on demand, via the `ltfs.sync` virtual EA | `Volume.Sync` on tape, and with it the pause's promise that the host can be switched off (DESIGN §11.1). Without it the index only lands at unmount, so durability would require owning the mount — and a pause would have to write its checkpoint after the release rather than after the flush | Set the EA on a mounted cartridge and check the index generation moved. `syscall.Setxattr` is in the standard library, so the mechanism costs no dependency |
 | `/sys/class/scsi_tape/*/device` and `/sys/class/scsi_generic/*/device` resolve to the same SCSI address | Finding the drive's sg node without asking the operator, which is what keeps `-device` an override rather than a required flag | Compare the two symlinks on the host. The `scsi_generic` half is confirmed; the tape half needs a drive attached |
 
 ## Working style

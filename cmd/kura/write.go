@@ -28,6 +28,8 @@ func runWrite(argv []string) {
 		copies   = fs.Int("catalog-copies", archive.DefaultCatalogCopies, "how many times to write the catalog onto the volume")
 		dryRun   = fs.Bool("dry-run", false, "read and digest everything, write nothing")
 		quiet    = fs.Bool("quiet", false, "suppress per-object progress")
+		recheck  = fs.Bool("verify-resumed", false,
+			"re-read the objects a pause vouched for instead of trusting its record of them")
 	)
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, `kura write - place one volume's share of a plan
@@ -53,6 +55,13 @@ belongs to rather than taken on trust.
 What goes in which container was settled by kura plan and is recorded in the
 plan file, so a write that is interrupted and re-run places exactly the same
 objects.
+
+It can be stopped and picked up again. Ctrl-C, SIGTERM, SIGHUP or kura pause all
+ask it to finish the object it is placing, flush the volume, write down what it
+put there and exit 75; the cartridge can then be ejected and the host switched
+off. Running it again resumes the same volume, and the objects the pause vouched
+for are not read back. A run that died instead — killed, or a power cut — left
+nothing to vouch for, so its resume reads the medium to find out what is on it.
 
 Flags:
 `)
@@ -129,6 +138,22 @@ Flags:
 		fatal(err)
 	}
 
+	// A checkpoint is read before anything is placed, but it is archive.Write
+	// that decides whether it applies: it alone knows which cartridge is
+	// actually loaded, and a pause is only good for the volume it names.
+	resume, err := archive.LoadCheckpoint(wd.Resume())
+	if err != nil {
+		// Warned about rather than fatal, because a checkpoint is an optimisation
+		// over a path that still works. A file this build cannot read — a newer
+		// format, or one truncated by a full disk — must not stop a write that
+		// can perfectly well resume by reading the medium back. Failing towards
+		// distrust is the whole shape of DESIGN §11.1.
+		fmt.Fprintf(os.Stderr, "warning: ignoring the paused write recorded in %s: %v\n", wd.Resume(), err)
+		fmt.Fprintf(os.Stderr, "  This volume will be read back to find out what is on it, which is slower but no less safe.\n")
+		resume = nil
+	}
+	pause := watchPause(wd)
+
 	// Applied before archive.Write, so the catalog copies this volume carries
 	// say what went away as well as what arrived. Persisting is left to the
 	// save that follows a successful write; Tombstone is idempotent, so a run
@@ -138,10 +163,15 @@ Flags:
 	written := int64(0)
 	opt := archive.Options{
 		Archive:       cat.Header.Archive,
+		Plan:          p.ID,
 		Generation:    p.Generation,
 		CatalogCopies: *copies,
 		StageDir:      wd.Stage(),
 		DryRun:        *dryRun,
+		Resume:        resume,
+		VerifyResumed: *recheck,
+		Pause:         pause.Asked,
+		OnStart:       pause.Starting,
 		OnObject: func(name string, size int64) {
 			written += size
 			if !*quiet {
@@ -165,6 +195,38 @@ Flags:
 	}
 	elapsed := time.Since(started)
 
+	if res.Paused {
+		// Nothing is committed to the catalog here, and that is the point: the
+		// records live in the checkpoint until the volume is finished, or
+		// alreadyWritten would make the next run skip the very cartridge it is
+		// meant to be finishing. DESIGN §11.1.
+		if res.Checkpoint != nil {
+			res.Checkpoint.Reason = pause.Reason()
+			if err := archive.SaveCheckpoint(wd.Resume(), res.Checkpoint); err != nil {
+				fatal(err)
+			}
+		}
+		resumeWith := "kura write -mount " + *mount
+		if *state.dir != "" {
+			resumeWith += " -workdir " + wd.Path
+		} else if *state.archive != "" {
+			resumeWith += " -archive " + *state.archive
+		}
+		if *planPath != "" {
+			resumeWith += " -plan " + *planPath
+		}
+		reportPause(res, elapsed, wd, resumeWith, *dryRun)
+		// Released explicitly, because os.Exit runs no deferred call and a pause
+		// is the one moment the medium has to become ejectable. Safe to call
+		// twice by the interface's own contract, so the deferred one above
+		// staying registered costs nothing.
+		if err := backend.Release(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: %s is written and recorded, but the drive did not release it: %v\n",
+				res.Volume, err)
+		}
+		os.Exit(exitPaused)
+	}
+
 	if !*dryRun {
 		// The volume already carries this catalog; the local copy is a cache of
 		// what the medium says.
@@ -172,6 +234,14 @@ Flags:
 		recordGeneration(cat, p.Generation, pv.ID, p.ID)
 		if err := catalog.Write(wd.Catalog(), cat.Header, cat.Records); err != nil {
 			fatal(err)
+		}
+		// The checkpoint has done its job once these records are in the catalog.
+		// Only this volume's, though: a pause on another one is still somebody's
+		// half-written cartridge.
+		if resume.Describes(cat.Header.Archive, p.ID, p.Generation, res.Volume) {
+			if err := archive.RemoveCheckpoint(wd.Resume()); err != nil {
+				fatal(err)
+			}
 		}
 	}
 
@@ -376,9 +446,13 @@ func reportWrite(res *archive.Result, elapsed time.Duration, dryRun bool, catalo
 		fmt.Printf("  %s at %s/s\n", elapsed.Round(time.Millisecond),
 			plan.FormatBytes(int64(float64(res.Bytes)/max(elapsed.Seconds(), 0.001))))
 	}
+	if res.Adopted > 0 {
+		fmt.Printf("  %d objects came from a pause and were taken as written, without being read back\n", res.Adopted)
+	}
 	if res.Resumed > 0 {
 		fmt.Printf("  %d objects were already present from an interrupted run and were read back rather than rewritten\n", res.Resumed)
 	}
+	reportResumeNotes(res)
 	if len(res.Problems) > 0 {
 		fmt.Printf("\n  %s could not be written and are NOT recorded, so the next cycle will try again:\n",
 			count(int64(len(res.Problems)), "file"))
@@ -391,6 +465,42 @@ func reportWrite(res *archive.Result, elapsed time.Duration, dryRun bool, catalo
 		return
 	}
 	fmt.Printf("\n  Catalog updated: %s. The volume carries its own copy.\n", catalogPath)
+}
+
+// reportPause says where a stopped run got to and what finishes it.
+func reportPause(res *archive.Result, elapsed time.Duration, wd workdir.Dir, resumeWith string, dryRun bool) {
+	fmt.Printf("\n=== PAUSED %s ===\n", res.Volume)
+	fmt.Printf("  %s in %d objects and %d containers, covering %d files\n",
+		plan.FormatBytes(res.Bytes), res.Objects, res.Containers, len(res.Records))
+	if elapsed > 0 {
+		fmt.Printf("  %s at %s/s\n", elapsed.Round(time.Millisecond),
+			plan.FormatBytes(int64(float64(res.Bytes)/max(elapsed.Seconds(), 0.001))))
+	}
+	if res.Adopted > 0 {
+		fmt.Printf("  %d of those came from an earlier pause and were not read again\n", res.Adopted)
+	}
+	fmt.Printf("  %d of this volume's entries are still to go.\n", res.Remaining)
+	reportResumeNotes(res)
+
+	if dryRun {
+		fmt.Printf("\n  Dry run: nothing was written, so there is nothing to resume.\n")
+		return
+	}
+	// Said plainly because it is the one thing the operator most needs to know
+	// and the one a pause could most easily be assumed not to give: the flush
+	// happened before this was recorded, so the medium is safe to eject.
+	fmt.Printf("\n  %s is flushed and safe to eject, and the host can be switched off.\n", res.Volume)
+	fmt.Printf("  What this run placed is written down in %s, so resuming does not read it back.\n", wd.Resume())
+	fmt.Printf("  Resume with: %s\n", resumeWith)
+}
+
+// reportResumeNotes prints what a resume could not take on trust. Each line is
+// either an object that will be read again or a file the next cycle owes a write,
+// so none of them is noise.
+func reportResumeNotes(res *archive.Result) {
+	for _, note := range res.ResumeNotes {
+		fmt.Printf("  ! %s\n", note)
+	}
 }
 
 func loadPlan(path string) (*plan.Plan, error) {

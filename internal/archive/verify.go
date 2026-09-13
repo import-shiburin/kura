@@ -36,6 +36,12 @@ type VerifyResult struct {
 
 	Findings []Finding
 
+	// Stopped reports that the operator asked the scrub to stop before it had
+	// read everything. A partial pass says nothing about the rest of the volume,
+	// so it neither stamps LastVerified nor reports what it never reached as
+	// unclaimed — and it is not Clean, whatever it found.
+	Stopped bool
+
 	// Unclaimed lists objects present on the volume that no record accounts
 	// for. They are reported rather than deleted: on media that never reclaims
 	// space, an object nothing remembers is a sign the catalog lost track of a
@@ -78,6 +84,13 @@ func Verify(ctx context.Context, vol volume.Volume, cat *catalog.Catalog, mark b
 	// sequential read and a seek per file.
 	byContainer := make(map[string][]*catalog.Record)
 	for _, r := range records {
+		// A scrub has nothing to commit, so it stops between objects and needs
+		// no checkpoint: the object in flight finishes and the volume is left
+		// exactly as it was found. DESIGN §11.1.
+		if ctx.Err() != nil {
+			res.Stopped = true
+			break
+		}
 		switch {
 		case r.Inside():
 			byContainer[r.Container] = append(byContainer[r.Container], r)
@@ -88,27 +101,40 @@ func Verify(ctx context.Context, vol volume.Volume, cat *catalog.Catalog, mark b
 		}
 	}
 	for name, members := range byContainer {
+		if res.Stopped || ctx.Err() != nil {
+			res.Stopped = true
+			break
+		}
 		res.checkContainer(ctx, vol, name, members, claimed)
 	}
 
-	objs, err := vol.List(ctx)
-	if err != nil {
-		return nil, err
-	}
-	for _, o := range objs {
-		if !claimed[o.Name] && !isGenerationObject(o.Name) {
-			res.Unclaimed = append(res.Unclaimed, o.Name)
+	// Skipped outright on a partial pass. Nothing the scrub did not reach is in
+	// claimed, so listing the volume now would report most of it as objects no
+	// record accounts for — an alarm about the operator's own Ctrl-C.
+	if !res.Stopped {
+		objs, err := vol.List(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, o := range objs {
+			if !claimed[o.Name] && !isGenerationObject(o.Name) {
+				res.Unclaimed = append(res.Unclaimed, o.Name)
+			}
 		}
 	}
 
 	res.Elapsed = time.Since(started)
 	if mark {
+		// markLost is still right on a partial pass: it acts on findings, and a
+		// finding is an object that was read and did not match. What was never
+		// reached produced no finding and is left alone.
 		res.markLost(cat)
 		info := cat.Header.Volume(res.Volume)
 		// Only a clean pass updates the timestamp. A volume with findings has
 		// not been verified; it has been found wanting, and it should still
-		// come up as overdue until it reads clean or is migrated.
-		if !res.Failed() {
+		// come up as overdue until it reads clean or is migrated. A volume only
+		// half read has not been verified either.
+		if !res.Failed() && !res.Stopped {
 			info.LastVerified = time.Now().UTC().Format(time.RFC3339)
 		}
 	}

@@ -38,6 +38,19 @@ const (
 	PlanName    = "plan.json"
 	StageName   = "stage"
 
+	// ResumeName holds what a deliberately paused write placed on the medium
+	// but has not committed to the catalog. Its presence is the only thing that
+	// tells a pause from a crash, and it is local on purpose: the medium cannot
+	// carry a mutable file, and a marker that goes missing has to fail towards
+	// distrust rather than away from it. DESIGN §11.1.
+	ResumeName = "resume.jsonl.gz"
+
+	// PauseName is the flag `kura pause` sets and a running write notices
+	// between objects. It exists because the write that most needs pausing is
+	// the one already running under a unit file, where there is no terminal to
+	// send a signal from.
+	PauseName = "PAUSE"
+
 	// archiveIDLen is the length of the hex archive ID that
 	// archive.NewArchiveID produces: 16 random bytes. Repeated here rather
 	// than imported because a workdir only has to recognise the shape of a
@@ -69,6 +82,8 @@ func At(path string) Dir { return Dir{Path: path} }
 func (d Dir) Catalog() string { return filepath.Join(d.Path, CatalogName) }
 func (d Dir) Plan() string    { return filepath.Join(d.Path, PlanName) }
 func (d Dir) Stage() string   { return filepath.Join(d.Path, StageName) }
+func (d Dir) Resume() string  { return filepath.Join(d.Path, ResumeName) }
+func (d Dir) Pause() string   { return filepath.Join(d.Path, PauseName) }
 
 func (d Dir) String() string { return d.Path }
 

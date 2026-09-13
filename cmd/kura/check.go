@@ -62,12 +62,17 @@ Flags:
 	if err := requireMountPoint(*mount, allowAnyDir); err != nil {
 		fatal(err)
 	}
-	ctx := context.Background()
+	ctx, stop := cancelOnSignal(context.Background())
+	defer stop()
 	backend, vol, err := openDrive(ctx, *mount, 0)
 	if err != nil {
 		fatal(err)
 	}
-	defer backend.Release(ctx)
+	// Released on a live context, not the one above. A signal cancels ctx, and
+	// unmounting is precisely the work that still has to happen after one — a
+	// backend that does real I/O to let go of the medium would be handed a dead
+	// context at the only moment it matters.
+	defer backend.Release(context.Background())
 
 	fmt.Fprintf(os.Stderr, "verifying %s ...\n", loadedVolume(ctx, vol, *volumeID))
 	res, err := archive.Verify(ctx, vol, cat, !*noMark)
@@ -98,6 +103,17 @@ Flags:
 		}
 		fmt.Printf("  Left alone. On media that never reclaims space this means the catalog\n")
 		fmt.Printf("  lost track of a write, which is worth looking at rather than tidying away.\n")
+	}
+	if res.Stopped {
+		fmt.Printf("\n  STOPPED before the whole volume was read, so this is not a verdict on %s.\n", res.Volume)
+		fmt.Printf("  Nothing was changed and nothing is half done; run kura verify again to start over.\n")
+		if res.Failed() {
+			fmt.Printf("\n  What it did read found %s:\n", count(int64(len(res.Findings)), "problem"))
+			for _, f := range res.Findings {
+				fmt.Printf("    %s\n      via %s: %v\n", f.Path, f.Object, f.Err)
+			}
+		}
+		os.Exit(exitPaused)
 	}
 	if !res.Failed() {
 		fmt.Printf("\n  Clean.\n")
@@ -168,12 +184,17 @@ Flags:
 	if err := requireMountPoint(*mount, allowAnyDir); err != nil {
 		fatal(err)
 	}
-	ctx := context.Background()
+	ctx, stop := cancelOnSignal(context.Background())
+	defer stop()
 	backend, vol, err := openDrive(ctx, *mount, 0)
 	if err != nil {
 		fatal(err)
 	}
-	defer backend.Release(ctx)
+	// Released on a live context, not the one above. A signal cancels ctx, and
+	// unmounting is precisely the work that still has to happen after one — a
+	// backend that does real I/O to let go of the medium would be handed a dead
+	// context at the only moment it matters.
+	defer backend.Release(context.Background())
 
 	fmt.Fprintf(os.Stderr, "restoring generation %d from %s into %s ...\n", gen, loadedVolume(ctx, vol, *volumeID), *into)
 	res, err := archive.Restore(ctx, vol, cat, gen, *into, !*noVerify)
@@ -217,6 +238,12 @@ Flags:
 		for _, f := range res.Failed {
 			fmt.Printf("    %s\n      via %s: %v\n", f.Path, f.Object, f.Err)
 		}
+	}
+	if res.Stopped {
+		fmt.Printf("\n  STOPPED on request. Every file above is whole — each is written through a\n")
+		fmt.Printf("  temporary and renamed — but the tree is not finished. Run kura restore again;\n")
+		fmt.Printf("  it starts over, and overwrites what it already produced.\n")
+		os.Exit(exitPaused)
 	}
 	if !res.OK() {
 		fmt.Printf("\n  This restore is incomplete. Nothing above was silently skipped.\n")

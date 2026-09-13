@@ -253,6 +253,7 @@ Flags:
 	if err := writePlanFile(p, wd.Plan()); err != nil {
 		fatal(err)
 	}
+	retireAbandonedPause(wd, p.Generation)
 	fmt.Printf("\nplan written to %s\n", wd.Plan())
 	// Echoed with the same workdir selection this run used, because a plan made
 	// somewhere other than the default root is one the next command has to be
@@ -341,6 +342,16 @@ func unfinishedCycle(wd workdir.Dir, cat *catalog.Catalog) (*plan.Plan, []string
 	if err != nil {
 		return nil, nil
 	}
+	// A paused volume counts as started even though it has put nothing in the
+	// catalog — that is exactly what a pause is (DESIGN §11.1). Without this a
+	// pause on the *first* volume of a cycle would leave written at zero, and
+	// replacing the plan would abandon a cartridge holding objects that nothing
+	// indexes and no plan can finish.
+	paused := ""
+	if cp, err := archive.ReadCheckpointHeader(wd.Resume()); err == nil && cp != nil && cp.Generation == prev.Generation {
+		paused = cp.Volume
+	}
+
 	var left []string
 	written := 0
 	for _, pv := range prev.Volumes {
@@ -348,12 +359,43 @@ func unfinishedCycle(wd workdir.Dir, cat *catalog.Catalog) (*plan.Plan, []string
 			written++
 			continue
 		}
+		if pv.ID == paused {
+			written++
+		}
 		left = append(left, pv.ID)
 	}
 	if written == 0 || len(left) == 0 {
 		return nil, nil
 	}
 	return prev, left
+}
+
+// retireAbandonedPause clears a checkpoint whose cycle this plan has replaced.
+//
+// Reached only past the part-written refusal above, so either -force was given or
+// the paused cycle was already finished. Either way the checkpoint now names a
+// generation nothing can complete, and leaving it would have a note about a
+// pause that cannot be resumed printed on every write for the rest of the
+// archive's life.
+//
+// The cartridge is what the message is really about. Its objects are still there,
+// indexed by nothing, on media that never reclaims — so the operator is told
+// which one, while they can still go and look at it.
+func retireAbandonedPause(wd workdir.Dir, gen int) {
+	cp, err := archive.ReadCheckpointHeader(wd.Resume())
+	if err != nil || cp == nil || cp.Generation == gen {
+		return
+	}
+	if err := archive.RemoveCheckpoint(wd.Resume()); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not clear the abandoned pause in %s: %v\n", wd.Resume(), err)
+		return
+	}
+	fmt.Fprintf(os.Stderr,
+		"note: %s was paused part way through generation %d, and that cycle is now abandoned.\n"+
+			"  %s of its own are on that cartridge with nothing indexing them, and the space\n"+
+			"  cannot be reclaimed. The files themselves are safe: they were never recorded as\n"+
+			"  stored, so this plan writes them again.\n",
+		cp.Volume, cp.Generation, count(int64(cp.Count), "object"))
 }
 
 func writePlanFile(p *plan.Plan, path string) (err error) {

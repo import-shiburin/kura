@@ -38,10 +38,16 @@ type RestoreResult struct {
 
 	// Lost lists objects the catalog already knows cannot be produced.
 	Lost []string
+
+	// Stopped reports that the operator asked the restore to stop before it had
+	// written everything this volume owed. The files it did write are whole —
+	// each goes through a temporary and a rename — but the tree is not, so this
+	// is never OK.
+	Stopped bool
 }
 
 // OK reports whether everything this volume owed was produced.
-func (r *RestoreResult) OK() bool { return len(r.Failed) == 0 && len(r.Lost) == 0 }
+func (r *RestoreResult) OK() bool { return len(r.Failed) == 0 && len(r.Lost) == 0 && !r.Stopped }
 
 // PartialSuffix marks a file that is only as complete as the volumes restored
 // so far. A split file spans cartridges, and a half-written file under its real
@@ -81,6 +87,13 @@ func Restore(ctx context.Context, vol volume.Volume, cat *catalog.Catalog, gen i
 
 	byContainer := make(map[string][]*catalog.Record)
 	for _, rec := range here {
+		// Like a scrub, a restore has nothing to commit: every file goes through
+		// a temporary and a rename, so stopping between records leaves a correct
+		// subset of the tree and a re-run simply does it again. DESIGN §11.1.
+		if ctx.Err() != nil {
+			res.Stopped = true
+			break
+		}
 		switch {
 		case rec.Inside():
 			byContainer[rec.Container] = append(byContainer[rec.Container], rec)
@@ -98,6 +111,10 @@ func Restore(ctx context.Context, vol volume.Volume, cat *catalog.Catalog, gen i
 	}
 	sort.Strings(names)
 	for _, name := range names {
+		if res.Stopped || ctx.Err() != nil {
+			res.Stopped = true
+			break
+		}
 		res.restoreContainer(ctx, vol, name, byContainer[name], dest, verify)
 	}
 

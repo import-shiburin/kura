@@ -1,3 +1,9 @@
+Yes, I know, this is currently a slop.
+
+I will at some point do the whole code review, but can't sure when it will be.
+Would appreciate any help (including just pointing out what I've missed) if you're interested.
+
+---
 # kura
 
 An archiver for **offline, append-only media** — LTO tape, optical, or a shelf
